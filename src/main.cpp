@@ -1722,8 +1722,9 @@ const char* settingsPage = R"rawliteral(
     </div>
   </header>
   <form id="settingsForm">
+    
     <fieldset>
-      <legend>Pressure &amp; Temp Setpoints</legend>
+      <legend>High-Pressure &amp; Ratio</legend>
       <div class="field">
         <label for="targetInput">Target Pressure (PSI)</label>
         <input type="number" id="targetInput" name="target" min="0" max="1600" />
@@ -1739,7 +1740,10 @@ const char* settingsPage = R"rawliteral(
         <input type="number" id="diffInput" name="diff" min="0" max="1600" />
         <div class="hint">Used for ratio indicator and quick checks.</div>
       </div>
+    </fieldset>
 
+    <fieldset>
+      <legend>Air &amp; Low-Side Pressure</legend>
       <div class="field">
         <label for="airTargetInput">Air Piston Set Point (PSI)</label>
         <input type="number" id="airTargetInput" name="airTarget" min="0" max="200" />
@@ -1750,7 +1754,6 @@ const char* settingsPage = R"rawliteral(
         <input type="number" id="gunTargetInput" name="gunTarget" min="0" max="200" />
         <div class="hint">Target pressure for the Gun AP gauge (0–200&nbsp;PSI).</div>
       </div>
-
       <div class="field">
         <label for="isoLowTargetInput">Iso Low Set Point (PSI)</label>
         <input type="number" id="isoLowTargetInput" name="isoLowTarget" min="0" max="500" />
@@ -1761,7 +1764,6 @@ const char* settingsPage = R"rawliteral(
         <input type="number" id="resinLowTargetInput" name="resinLowTarget" min="0" max="500" />
         <div class="hint">Target for low-pressure Resin feed (0–500&nbsp;PSI).</div>
       </div>
-
       <div class="field">
         <label for="supplyLowInput">Supply Low Pressure (PSI)</label>
         <input type="number" id="supplyLowInput" name="supplyLow" min="0" max="500" />
@@ -1770,7 +1772,10 @@ const char* settingsPage = R"rawliteral(
           must be above this to enter Spray.
         </div>
       </div>
+    </fieldset>
 
+    <fieldset>
+      <legend>Temperature Targets</legend>
       <div class="field">
         <label for="isoTempTargetInput">Iso HP Temp Target (°F)</label>
         <input type="number" id="isoTempTargetInput" name="isoTempTarget" min="-40" max="300" />
@@ -1781,7 +1786,6 @@ const char* settingsPage = R"rawliteral(
         <input type="number" id="resinTempTargetInput" name="resinTempTarget" min="-40" max="300" />
         <div class="hint">Target Resin outlet temp; green band shown on HP Resin temp ring.</div>
       </div>
-
       <div class="field">
         <label for="isoLowTempTargetInput">Iso Low Temp Target (°F)</label>
         <input type="number" id="isoLowTempTargetInput" name="isoLowTempTarget" min="-40" max="300" />
@@ -1792,7 +1796,6 @@ const char* settingsPage = R"rawliteral(
         <input type="number" id="resinLowTempTargetInput" name="resinLowTempTarget" min="-40" max="300" />
         <div class="hint">Target temp for low-side Resin feed; drives green band on Resin Low gauge.</div>
       </div>
-
       <div class="field">
         <label for="tempMinInput">Temp Gauge Minimum (°F)</label>
         <input type="number" id="tempMinInput" name="tempMinF" min="-40" max="300" />
@@ -1803,7 +1806,10 @@ const char* settingsPage = R"rawliteral(
         <input type="number" id="tempMaxInput" name="tempMaxF" min="-40" max="300" />
         <div class="hint">Upper bound for the temp ring (all four sensors share this scale).</div>
       </div>
+    </fieldset>
 
+    <fieldset>
+      <legend>Temperature Sensors</legend>
       <div class="field">
         <label for="isoTempSensorSelect">Iso HP Temp Sensor</label>
         <select id="isoTempSensorSelect"></select>
@@ -1812,7 +1818,6 @@ const char* settingsPage = R"rawliteral(
           <br/>Assign a DS18B20 to the Iso HP outlet.
         </div>
       </div>
-
       <div class="field">
         <label for="resinTempSensorSelect">Resin HP Temp Sensor</label>
         <select id="resinTempSensorSelect"></select>
@@ -1821,7 +1826,6 @@ const char* settingsPage = R"rawliteral(
           <br/>Assign a DS18B20 to the Resin HP outlet.
         </div>
       </div>
-
       <div class="field">
         <label for="isoLowTempSensorSelect">Iso Low Temp Sensor</label>
         <select id="isoLowTempSensorSelect"></select>
@@ -1830,7 +1834,6 @@ const char* settingsPage = R"rawliteral(
           <br/>Assign a DS18B20 to the low-side Iso feed.
         </div>
       </div>
-
       <div class="field">
         <label for="resinLowTempSensorSelect">Resin Low Temp Sensor</label>
         <select id="resinLowTempSensorSelect"></select>
@@ -1840,6 +1843,7 @@ const char* settingsPage = R"rawliteral(
         </div>
       </div>
     </fieldset>
+
 
     <fieldset>
       <legend>Calibration Controls</legend>
