@@ -2512,7 +2512,7 @@ void handleCalibration() {
   } else if (!strcmp(action, "span")) {
     if (!doc.containsKey("pressure")) {
       out["ok"] = false;
-      out["error"] = "Missing pressure";
+      out["error"] = "Missing pressure";  
       String s;
       serializeJson(out, s);
       server.send(400, "application/json", s);
