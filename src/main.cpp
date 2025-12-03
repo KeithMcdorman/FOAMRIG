@@ -31,7 +31,7 @@
 #include <math.h>
 
 // ---------- Firmware version ----------
-const char* FW_VERSION = "V1.3";
+const char* FW_VERSION = "V1.4";
 
 // ---------- Sensor pins ----------
 // High-side pressures (0–1600 PSI)
