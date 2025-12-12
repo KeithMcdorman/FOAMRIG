@@ -24,6 +24,7 @@
 #include <Preferences.h>
 #include <ArduinoJson.h>
 #include <Update.h>
+#include <HardwareSerial.h>
 
 #include <OneWire.h>
 #include <DallasTemperature.h>
@@ -138,6 +139,10 @@ const unsigned long WIFI_FALLBACK_MS = 5UL * 60UL * 1000UL; // 5 minutes
 WebServer        server(80);
 WebSocketsServer webSocket(81);
 Preferences      prefs;
+
+// UART link to HMI (ESP32-P4 display)
+HardwareSerial HMISerial(2);
+static String hmiRxBuffer;
 
 // Global settings (loaded from Preferences)
 int  targetPressure = 1000;
@@ -2451,7 +2456,7 @@ float applyCalibration(float raw, float R0, float K, float fullScalePsi) {
 // /api/settings
 void handleSettings() {
   if (server.method() == HTTP_GET) {
-    DynamicJsonDocument doc(896);
+    JsonDocument doc;
     doc["target"]         = targetPressure;
     doc["margin"]         = marginPercent;
     doc["diff"]           = diffPressure;
@@ -2478,7 +2483,7 @@ void handleSettings() {
     serializeJson(doc, json);
     server.send(200, "application/json", json);
   } else if (server.method() == HTTP_POST) {
-    DynamicJsonDocument doc(512);
+    JsonDocument doc;
     DeserializationError error = deserializeJson(doc, server.arg("plain"));
     if (error) {
       server.send(400, "text/plain", "Invalid JSON");
@@ -2500,25 +2505,25 @@ void handleSettings() {
     tempMinF            = doc["tempMinF"]           | tempMinF;
     tempMaxF            = doc["tempMaxF"]           | tempMaxF;
 
-    if (doc.containsKey("wifiMode")) {
+    if (doc["wifiMode"].is<int>()) {
       networkMode = (int)doc["wifiMode"];
       if (networkMode != NETMODE_AP && networkMode != NETMODE_STA) {
         networkMode = NETMODE_AP;
       }
     }
-    if (doc.containsKey("apSsid")) {
+    if (doc["apSsid"].is<const char*>()) {
       const char* v = doc["apSsid"];
       if (v) apSsid = String(v);
     }
-    if (doc.containsKey("apPass")) {
+    if (doc["apPass"].is<const char*>()) {
       const char* v = doc["apPass"];
       if (v) apPass = String(v);
     }
-    if (doc.containsKey("staSsid")) {
+    if (doc["staSsid"].is<const char*>()) {
       const char* v = doc["staSsid"];
       if (v) staSsid = String(v);
     }
-    if (doc.containsKey("staPass")) {
+    if (doc["staPass"].is<const char*>()) {
       const char* v = doc["staPass"];
       if (v) staPass = String(v);
     }
@@ -2557,9 +2562,9 @@ void handleCalibration() {
     server.send(405, "text/plain", "Method Not Allowed");
     return;
   }
-  DynamicJsonDocument doc(256);
+  JsonDocument doc;
   DeserializationError error = deserializeJson(doc, server.arg("plain"));
-  DynamicJsonDocument out(256);
+  JsonDocument out;
   if (error) {
     out["ok"] = false;
     out["error"] = "Invalid JSON";
@@ -2602,7 +2607,7 @@ void handleCalibration() {
     out["ok"] = true;
     out["raw0"] = raw0;
   } else if (!strcmp(action, "span")) {
-    if (!doc.containsKey("pressure")) {
+    if (!doc["pressure"].is<float>() && !doc["pressure"].is<int>()) {
       out["ok"] = false;
       out["error"] = "Missing pressure";
       String s;
@@ -2646,13 +2651,13 @@ void handleCalibration() {
 
 // /calibration/status
 void handleCalibrationStatus() {
-  DynamicJsonDocument doc(512);
-  JsonObject iso      = doc.createNestedObject("iso");      iso["R0"] = isoR0;       iso["K"] = isoK;
-  JsonObject resin    = doc.createNestedObject("resin");    resin["R0"] = resinR0;   resin["K"] = resinK;
-  JsonObject isoLow   = doc.createNestedObject("isoLow");   isoLow["R0"] = isoLowR0; isoLow["K"] = isoLowK;
-  JsonObject resinLow = doc.createNestedObject("resinLow"); resinLow["R0"] = resinLowR0; resinLow["K"] = resinLowK;
-  JsonObject air      = doc.createNestedObject("air");      air["R0"] = airR0;       air["K"] = airK;
-  JsonObject apAir    = doc.createNestedObject("apAir");    apAir["R0"] = apAirR0;   apAir["K"] = apAirK;
+  JsonDocument doc;
+  JsonObject iso      = doc["iso"].to<JsonObject>();      iso["R0"] = isoR0;       iso["K"] = isoK;
+  JsonObject resin    = doc["resin"].to<JsonObject>();    resin["R0"] = resinR0;   resin["K"] = resinK;
+  JsonObject isoLow   = doc["isoLow"].to<JsonObject>();   isoLow["R0"] = isoLowR0; isoLow["K"] = isoLowK;
+  JsonObject resinLow = doc["resinLow"].to<JsonObject>(); resinLow["R0"] = resinLowR0; resinLow["K"] = resinLowK;
+  JsonObject air      = doc["air"].to<JsonObject>();      air["R0"] = airR0;       air["K"] = airK;
+  JsonObject apAir    = doc["apAir"].to<JsonObject>();    apAir["R0"] = apAirR0;   apAir["K"] = apAirK;
   String s;
   serializeJson(doc, s);
   server.send(200, "application/json", s);
@@ -2661,8 +2666,8 @@ void handleCalibrationStatus() {
 // /api/temp-sensors
 void handleTempSensors() {
   if (server.method() == HTTP_GET) {
-    DynamicJsonDocument doc(1024);
-    JsonArray arr = doc.createNestedArray("sensors");
+    JsonDocument doc;
+    JsonArray arr = doc["sensors"].to<JsonArray>();
 
     dsDeviceCount = tempSensors.getDeviceCount();
     DeviceAddress addr;
@@ -2673,7 +2678,7 @@ void handleTempSensors() {
     for (int i = 0; i < dsDeviceCount; i++) {
       if (tempSensors.getAddress(addr, i)) {
         String id = addressToString(addr);
-        JsonObject sObj = arr.createNestedObject();
+        JsonObject sObj = arr.add<JsonObject>();
         sObj["id"] = id;
 
         float tC = tempSensors.getTempC(addr);
@@ -2695,7 +2700,7 @@ void handleTempSensors() {
     server.send(200, "application/json", out);
   }
   else if (server.method() == HTTP_POST) {
-    DynamicJsonDocument doc(256);
+    JsonDocument doc;
     DeserializationError err = deserializeJson(doc, server.arg("plain"));
     if (err) {
       server.send(400, "text/plain", "Invalid JSON");
@@ -2725,7 +2730,7 @@ void handleTempSensors() {
     Serial.println("=== Temp assignments UPDATED via /api/temp-sensors ===");
     printDS18B20Addresses();
 
-    DynamicJsonDocument outDoc(128);
+    JsonDocument outDoc;
     outDoc["ok"] = true;
     String out;
     serializeJson(outDoc, out);
@@ -2739,7 +2744,7 @@ void handleTempSensors() {
 // /api/control  (for relays / modes)
 void handleControl() {
   if (server.method() == HTTP_GET) {
-    DynamicJsonDocument doc(128);
+    JsonDocument doc;
     doc["drumAir"] = drumAirEnabled;
     doc["spray"]   = sprayEnabled;
     String s;
@@ -2753,9 +2758,9 @@ void handleControl() {
     return;
   }
 
-  DynamicJsonDocument doc(256);
+  JsonDocument doc;
   DeserializationError err = deserializeJson(doc, server.arg("plain"));
-  DynamicJsonDocument out(256);
+  JsonDocument out;
   if (err) {
     out["ok"] = false;
     out["error"] = "Invalid JSON";
@@ -2765,7 +2770,7 @@ void handleControl() {
     return;
   }
 
-  if (doc.containsKey("drumAir")) {
+  if (doc["drumAir"].is<bool>()) {
     bool desired = doc["drumAir"];
     drumAirEnabled = desired;
     digitalWrite(RELAY_DRUM_AIR_PIN, drumAirEnabled ? HIGH : LOW);
@@ -2776,7 +2781,7 @@ void handleControl() {
     }
   }
 
-  if (doc.containsKey("spray")) {
+  if (doc["spray"].is<bool>()) {
     bool desired = doc["spray"];
 
     if (desired) {
@@ -2890,6 +2895,11 @@ void setup() {
   Serial.begin(115200);
   delay(300);
   Serial.println("\n=== Foam rig boot ===");
+
+  // HMI UART on GPIO16 (RX) and GPIO17 (TX)
+  HMISerial.begin(115200, SERIAL_8N1, 16, 17);
+  Serial.println("HMI UART started on GPIO16/17 @115200");
+
 
   analogReadResolution(12);
   analogSetPinAttenuation(SENSOR_A_PIN,         ADC_11db);
@@ -3098,10 +3108,182 @@ void setup() {
   Serial.println("WebSocket server started");
 }
 
+
+// -----------------------------------------------------------------------------
+// HMI UART command handling
+// -----------------------------------------------------------------------------
+
+// Handle a parsed JSON command coming from the HMI
+void hmiHandleCommand(const JsonDocument &doc)
+{
+  // HMI may send either:
+  //   [{"cmd":"spray","value":1}]
+  // or:
+  //   {"cmd":"spray","value":1}
+  //
+  // We treat root as:
+  //   - element 0 if it's an array
+  //   - otherwise the document itself
+
+  JsonVariantConst obj;
+
+  JsonVariantConst first = doc[0];  // if root is array, this is element 0; otherwise null
+  if (!first.isNull()) {
+    obj = first;
+  } else {
+    obj = doc;  // treat root as object
+  }
+
+  if (!obj.is<JsonObject>()) {
+    return;
+  }
+
+  // cmd must be a string
+  if (!obj["cmd"].is<const char*>()) {
+    return;
+  }
+  const char *cmd = obj["cmd"].as<const char*>();
+  if (!cmd) return;
+
+  // Treat "value" / "state" as a momentary press indicator.
+  // We only act when it's true/non‑zero.
+  bool pressed = true;  // default: if no field, assume press
+  if (obj["state"].is<bool>()) {
+    pressed = obj["state"].as<bool>();
+  } else if (obj["value"].is<bool>()) {
+    pressed = obj["value"].as<bool>();
+  } else if (obj["value"].is<int>()) {
+    pressed = (obj["value"].as<int>() != 0);
+  } else if (obj["value"].is<float>()) {
+    pressed = (obj["value"].as<float>() != 0.0f);
+  }
+
+  if (!pressed) {
+    return;  // ignore "no‑press" messages
+  }
+
+  bool isSprayCmd =
+      (strcmp(cmd, "setSpray") == 0) ||
+      (strcmp(cmd, "spray")    == 0);
+
+  bool isDrumCmd =
+      (strcmp(cmd, "setDrumAir") == 0) ||
+      (strcmp(cmd, "setDrum")    == 0) ||
+      (strcmp(cmd, "drum")       == 0);
+
+  // -------- Drum Air control (toggle) --------
+  if (isDrumCmd) {
+    bool desired = !drumAirEnabled;   // toggle
+    drumAirEnabled = desired;
+    digitalWrite(RELAY_DRUM_AIR_PIN, drumAirEnabled ? HIGH : LOW);
+
+    // If you kill drum air, also drop spray as a safety
+    if (!drumAirEnabled) {
+      sprayEnabled = false;
+      digitalWrite(RELAY_SPRAY_PIN, LOW);
+    }
+    return;
+  }
+
+  // -------- Spray control (toggle with same interlocks as /api/control) --------
+  if (isSprayCmd) {
+    bool desired = !sprayEnabled;  // toggle
+
+    if (desired) {
+      // Guard: require both low sides above threshold
+      if (!(lastIsoLowPSI >= supplyLowPSI && lastResinLowPSI >= supplyLowPSI)) {
+        sprayInterlockActive = true;
+        lastInterlockReason  = "Interlock: low supply pressure on feed side.";
+        sprayEnabled         = false;
+        digitalWrite(RELAY_SPRAY_PIN, LOW);
+        return;
+      }
+
+      // Guard: require drum air
+      if (!drumAirEnabled) {
+        sprayInterlockActive = true;
+        lastInterlockReason  = "Interlock: drum air not enabled.";
+        sprayEnabled         = false;
+        digitalWrite(RELAY_SPRAY_PIN, LOW);
+        return;
+      }
+
+      // Preconditions OK – enable spray and clear any latched interlock
+      sprayEnabled         = true;
+      digitalWrite(RELAY_SPRAY_PIN, HIGH);
+      sprayInterlockActive = false;
+      lastInterlockReason  = "";
+    } else {
+      // Just turn spray off
+      sprayEnabled = false;
+      digitalWrite(RELAY_SPRAY_PIN, LOW);
+    }
+    return;
+  }
+
+  // Unknown cmd – ignore for now
+}
+
+// Read bytes from HMISerial, assemble into newline‑terminated JSON lines
+void hmiPollUart()
+{
+  while (HMISerial.available() > 0) {
+    char c = (char)HMISerial.read();
+
+    // Ignore CR, treat LF as line terminator
+    if (c == '\r') continue;
+
+    if (c == '\n') {
+      if (hmiRxBuffer.length() == 0) {
+        // Empty line, ignore
+        continue;
+      }
+
+      // Debug: show exactly what we received
+      Serial.print("HMI RX line: [");
+      Serial.print(hmiRxBuffer);
+      Serial.println("]");
+
+      // Basic sanity: if it doesn't start with '{' or '[', it is not JSON
+      char first = hmiRxBuffer[0];
+      if (first != '{' && first != '[') {
+        Serial.println("HMI line ignored (does not look like JSON)");
+        hmiRxBuffer = "";
+        continue;
+      }
+
+      StaticJsonDocument<256> doc;
+      DeserializationError err = deserializeJson(doc, hmiRxBuffer);
+
+      if (err) {
+        Serial.print("HMI JSON parse error: ");
+        Serial.println(err.c_str());
+      } else {
+        hmiHandleCommand(doc);
+      }
+
+      // Reset buffer for next line
+      hmiRxBuffer = "";
+    } else {
+      // Regular character – append as long as we don't overflow
+      if (hmiRxBuffer.length() < 255) {
+        hmiRxBuffer += c;
+      } else {
+        // Overflow safeguard – drop the line
+        hmiRxBuffer = "";
+      }
+    }
+  }
+}
+
 void loop() {
   server.handleClient();
   webSocket.loop();
   handleWifiFallback();
+
+  // Poll UART link from HMI for control commands
+  hmiPollUart();
+
 
   static unsigned long last         = 0;
   static unsigned long lastTempRead = 0;
@@ -3209,6 +3391,7 @@ void loop() {
 
     json += "}";
     webSocket.broadcastTXT(json);
+    HMISerial.println(json);
     last = now;
   }
 
