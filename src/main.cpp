@@ -112,7 +112,7 @@ static inline void hoseLedInit() {
   hoseLedWrite(0);
 }
 static inline void hoseLedWrite(uint32_t duty) {
-  hoseLedWrite(duty);
+  ledcWrite(HOSE_LED_LEDC_CH, duty);
 }
 #endif
 
@@ -3420,7 +3420,7 @@ void loop() {
 
     if (isoPSI <= 0.0f) {
       // Rig idle
-      hoseLedMode = HOSE_LED_OFF;
+      hoseLedMode = HOSE_LED_PULSE;
     } else if (isoPSI < isoBandLow) {
       // Below green band → slow blink
       hoseLedMode = HOSE_LED_BLINK_SLOW;
