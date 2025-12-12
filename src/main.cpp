@@ -32,7 +32,7 @@
 #include <math.h>
 
 // ---------- Firmware version ----------
-const char* FW_VERSION = "V1.4";
+const char* FW_VERSION = "V2.0.0";
 
 // ---------- Sensor pins ----------
 // High-side pressures (0–1600 PSI)
@@ -79,6 +79,11 @@ const char* FW_VERSION = "V1.4";
 // Logical names the rest of the code already uses:
 #define RELAY_SPRAY_PIN     RELAY3_PIN
 #define RELAY_DRUM_AIR_PIN  RELAY4_PIN
+
+// Hose heat relays (two sections)
+#define RELAY_HOSE1_PIN     RELAY5_PIN
+#define RELAY_HOSE2_PIN     RELAY6_PIN
+
 
 // ---------- Hose-tip indicator LED ----------
 // Mounted at the end of the spray hose.
@@ -245,6 +250,35 @@ bool sprayEnabled   = false;  // relay on 25
 float lastIsoLowPSI   = 0.0f;
 float lastResinLowPSI = 0.0f;
 
+// ---------- Hose heat control (2 zones) ----------
+// Backend-only for now: exposes enable/setpoint/tolerance + relay output state
+// via status JSON and /api endpoints so the HMI can fully emulate the web UI later.
+
+bool hose1Enabled = false;
+bool hose2Enabled = false;
+
+// Setpoints and tolerance (°F). Tolerance is a +/- hysteresis band to minimize cycling.
+int hose1SetF = 125;
+int hose2SetF = 125;
+int hose1TolF = 3;
+int hose2TolF = 3;
+
+// Current relay call-for-heat state (latched by hysteresis logic)
+bool hose1Heating = false;
+bool hose2Heating = false;
+
+// Hose temperature readings (°F) from DS18B20 assignments
+float hose1TempF = NAN;
+float hose2TempF = NAN;
+
+// DS18B20 assignments for hose heat sensors
+DeviceAddress hose1TempAddr;
+DeviceAddress hose2TempAddr;
+bool hose1TempAssigned = false;
+bool hose2TempAssigned = false;
+String hose1TempAddrStr;
+String hose2TempAddrStr;
+
 // Hose-end status LED mode
 enum HoseLedMode {
   HOSE_LED_OFF        = 0,
@@ -293,29 +327,40 @@ bool parseAddressString(const String& s, uint8_t addr[8]) {
 // Just for debugging: show discovered sensors & which are assigned
 void printDS18B20Addresses() {
   Serial.println("=== Temp assignments restored from NVS ===");
-  Serial.printf("Iso HP:      '%s'\r\n", isoTempAddrStr.c_str());
-  Serial.printf("Resin HP:    '%s'\r\n", resinTempAddrStr.c_str());
-  Serial.printf("Iso Low:     '%s'\r\n", isoLowTempAddrStr.c_str());
-  Serial.printf("Resin Low:   '%s'\r\n", resinLowTempAddrStr.c_str());
-  Serial.printf("Assigned flags: iso=%d resin=%d isoLow=%d resinLow=%d\r\n",
-                isoTempAssigned, resinTempAssigned,
-                isoLowTempAssigned, resinLowTempAssigned);
+
+  Serial.printf("Iso HP:      '%s'\n", isoTempAddrStr.c_str());
+  Serial.printf("Resin HP:    '%s'\n", resinTempAddrStr.c_str());
+  Serial.printf("Iso Low:     '%s'\n", isoLowTempAddrStr.c_str());
+  Serial.printf("Resin Low:   '%s'\n", resinLowTempAddrStr.c_str());
+  Serial.printf("Hose 1:      '%s'\n", hose1TempAddrStr.c_str());
+  Serial.printf("Hose 2:      '%s'\n", hose2TempAddrStr.c_str());
+
+  Serial.printf(
+      "Assigned flags: iso=%d resin=%d isoLow=%d resinLow=%d hose1=%d hose2=%d\n",
+      (int)isoTempAssigned, (int)resinTempAssigned,
+      (int)isoLowTempAssigned, (int)resinLowTempAssigned,
+      (int)hose1TempAssigned, (int)hose2TempAssigned);
 
   dsDeviceCount = tempSensors.getDeviceCount();
-  Serial.printf("Found %d DS18B20 device(s) on bus\r\n", dsDeviceCount);
+  Serial.printf("Found %d DS18B20 device(s) on bus\n", dsDeviceCount);
+
   for (int i = 0; i < dsDeviceCount; i++) {
     DeviceAddress addr;
     if (tempSensors.getAddress(addr, i)) {
       String s = addressToString(addr);
-      Serial.printf("  Index %d address: %s\r\n", i, s.c_str());
+      Serial.printf("  Index %d address: %s\n", i, s.c_str());
     } else {
-      Serial.printf("  Index %d: <no address>\r\n", i);
+      Serial.printf("  Index %d: <no address>\n", i);
     }
   }
-  Serial.printf("Assigned Iso HP Temp:   %s\r\n", isoTempAddrStr.c_str());
-  Serial.printf("Assigned Resin HP Temp: %s\r\n", resinTempAddrStr.c_str());
-  Serial.printf("Assigned Iso Low Temp:  %s\r\n", isoLowTempAddrStr.c_str());
-  Serial.printf("Assigned Resin Low Temp:%s\r\n", resinLowTempAddrStr.c_str());
+
+  // Reprint assignments in a compact, aligned form (useful after /api/temp-sensors updates)
+  Serial.printf("Assigned Iso HP Temp:    %s\n", isoTempAddrStr.c_str());
+  Serial.printf("Assigned Resin HP Temp:  %s\n", resinTempAddrStr.c_str());
+  Serial.printf("Assigned Iso Low Temp:   %s\n", isoLowTempAddrStr.c_str());
+  Serial.printf("Assigned Resin Low Temp: %s\n", resinLowTempAddrStr.c_str());
+  Serial.printf("Assigned Hose 1 Temp:    %s\n", hose1TempAddrStr.c_str());
+  Serial.printf("Assigned Hose 2 Temp:    %s\n", hose2TempAddrStr.c_str());
 }
 
 // ---------- WiFi / network ----------
@@ -448,6 +493,7 @@ const char* updatePage = R"rawliteral(
       --text-muted: #9ca3af;
       --good: #22c55e;
       --bad: #ef4444;
+      --gap: 0.4rem;
     }
 
     * {
@@ -554,6 +600,7 @@ const char* updatePage = R"rawliteral(
 
     .upload-row {
       display: flex;
+      flex-direction: column;
       align-items: center;
       gap: 0.6rem;
       margin-top: 0.4rem;
@@ -769,21 +816,20 @@ const char* mainPage = R"rawliteral(
       gap: 0.4rem;
     }
 
-    .top-row,
-    .bottom-row {
-      display: flex;
-      align-items: stretch; /* stretch children to same height */
-    }
-
     .top-row {
-      justify-content: space-evenly;
-    }
+  display: grid;
+  grid-template-columns: minmax(260px, 1fr) minmax(260px, 0.95fr) minmax(260px, 1fr);
+  gap: var(--gap);
+  align-items: stretch;
+}
 
-    .bottom-row {
-      justify-content: space-between;
-    }
-
-    .gauge-card {
+.bottom-row {
+  display: grid;
+  grid-template-columns: repeat(6, minmax(0, 1fr));
+  gap: var(--gap);
+  align-items: stretch;
+}
+.gauge-card {
       background: radial-gradient(circle at top left, #0b1120 0, #020617 60%);
       border-radius: 16px;
       border: 1px solid var(--card-border);
@@ -795,24 +841,10 @@ const char* mainPage = R"rawliteral(
     }
 
     .gauge-card.large {
-      width: 34vw;
-      max-width: 380px;
-      min-width: 260px;
-    }
-
-    .gauge-card.large.left,
-    .gauge-card.large.right {
-      margin-left: 0;
-      margin-right: 0;
-    }
-
-    .gauge-card.large.left {
-      transform: translateX(2.5vw);
-    }
-
-    .gauge-card.large.right {
-      transform: translateX(-2.5vw);
-    }
+  width: 100%;
+  max-width: none;
+  min-width: 0;
+}
 
     .gauge-card.small {
       width: 20vw;
@@ -852,13 +884,176 @@ const char* mainPage = R"rawliteral(
     .center-column {
       display: flex;
       flex-direction: column;
-      gap: 0.3rem;
+      gap: var(--gap);
       align-items: stretch;
-      justify-content: stretch;
-      width: 12vw;
-      max-width: 180px;
-      min-width: 110px;
+      height: 100%;
+      width: 100%;
+      max-width: none;
+      min-width: 0;
     }
+
+    /* Make the center stack fill the same vertical space as the big gauges */
+    .center-column .action-row,
+    .center-column .enable-row {
+      flex: 1.2 1 0;
+      align-items: stretch;
+    }
+
+    .center-column .status-row {
+      flex: 1 1 0;
+      align-items: stretch;
+    }
+
+    .center-column .action-row .mode-btn {
+      height: 100%;
+    }
+
+    
+
+    .center-column .enable-row .mode-btn {
+      height: 100%;
+      /* Stack label over status (Hose enable buttons) */
+      flex-direction: column;
+      gap: 0.18rem;
+    }
+
+.center-column .status-row .hose-status-btn,
+    .center-column .status-row .ratio-card {
+      height: 100%;
+      min-height: 0;
+    }
+
+    .btn-row {
+      display: flex;
+      gap: var(--gap);
+      width: 100%;
+    }
+
+    .triple-row {
+      display: flex;
+      gap: var(--gap);
+      width: 100%;
+      align-items: stretch;
+    }
+
+    .triple-row > * {
+      flex: 1;
+    }
+
+    .btn-label {
+      display: block;
+      font-size: 0.65rem;
+      letter-spacing: 0.12em;
+      opacity: 0.82;
+      margin-bottom: 0.12rem;
+    }
+
+    .btn-sub {
+      display: block;
+      font-size: 1.05rem;
+      font-weight: 700;
+      letter-spacing: 0.06em;
+      opacity: 1;
+      margin-top: 0.05rem;
+    }
+
+    .hose-status-btn {
+      border-radius: 16px;
+      border: 1px solid rgba(148, 163, 184, 0.6);
+      background: rgba(15, 23, 42, 0.98);
+      color: var(--text-main);
+      padding: 0.35rem 0.35rem;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      text-align: center;
+          }
+
+    .hose-status-btn.heating {
+      background: linear-gradient(135deg, #22c55e, #16a34a);
+      color: #020617;
+      border-color: rgba(22,163,74,0.9);
+      box-shadow: 0 0 10px rgba(22,163,74,0.7);
+    }
+
+    .hose-label {
+      font-size: 0.75rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      margin-bottom: 0.25rem;
+    }
+
+    .hose-temp {
+      font-size: 1.05rem;
+      font-weight: 700;
+      line-height: 1.2;
+    }
+
+    .hose-state {
+      margin-top: 0.15rem;
+      font-size: 0.7rem;
+      letter-spacing: 0.1em;
+      text-transform: uppercase;
+      opacity: 0.9;
+    }
+
+    .bottom-row .gauge-card.small {
+      width: 100%;
+      max-width: none;
+      min-width: 0;
+    }
+
+    .setpoint-card {
+      padding: 0;
+      overflow: hidden;
+      justify-content: stretch;
+    }
+
+    .setpoint-card .sp-btn {
+      width: 100%;
+      flex: 0 0 25%;
+      border: none;
+      background: rgba(15, 23, 42, 0.98);
+      color: var(--text-main);
+      font-size: 1.25rem;
+      font-weight: 800;
+      padding: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-bottom: 1px solid rgba(148, 163, 184, 0.35);
+    }
+
+    .setpoint-card .sp-btn.sp-down {
+      border-top: 1px solid rgba(148, 163, 184, 0.35);
+      border-bottom: none;
+    }
+
+    .setpoint-card .sp-center {
+      flex: 0 0 50%;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      padding: 0.35rem 0.25rem;
+      gap: 0.2rem;
+    }
+
+    .setpoint-card .sp-label {
+      font-size: 0.75rem;
+      letter-spacing: 0.12em;
+      text-transform: uppercase;
+      color: var(--text-muted);
+      text-align: center;
+    }
+
+    .setpoint-card .sp-value {
+      font-size: 1.2rem;
+      font-weight: 800;
+    }
+
 
     .ratio-card {
       padding: 0.3rem 0.3rem 0.45rem;
@@ -974,8 +1169,7 @@ const char* mainPage = R"rawliteral(
       }
       .top-row,
       .bottom-row {
-        flex-direction: column;
-        align-items: stretch;
+        grid-template-columns: 1fr;
         gap: 0.6rem;
       }
       .gauge-card.large,
@@ -988,12 +1182,12 @@ const char* mainPage = R"rawliteral(
         width: 100%;
         max-width: none;
         min-width: 0;
-        flex-direction: row;
-        align-items: stretch;
+        height: auto;
       }
-      .center-column > .mode-btn,
-      .center-column > .ratio-card {
-        flex: 1;
+      .center-column .action-row,
+      .center-column .status-row,
+      .center-column .enable-row {
+        flex: 0 0 auto;
       }
       .ratio-card {
         margin: 0;
@@ -1034,8 +1228,19 @@ const char* mainPage = R"rawliteral(
       </div>
 
       <div class="center-column">
-        <button id="sprayBtn" class="mode-btn">Spray</button>
-        <div class="ratio-card">
+        <div class="btn-row action-row">
+          <button id="sprayBtn" class="mode-btn">Spray</button>
+          <button id="drumAirBtn" class="mode-btn">Drum Air</button>
+        </div>
+
+        <div class="triple-row status-row">
+          <button id="hose1StatusBtn" class="hose-status-btn">
+            <div class="hose-label">Hose 1</div>
+            <div class="hose-temp" id="hose1TempDisplay">-- °F</div>
+            <div class="hose-state" id="hose1StateDisplay">OFF</div>
+          </button>
+
+          <div class="ratio-card">
           <div class="ratio-label-top">Ratio</div>
           <div id="ratioCircle" class="ratio-circle">
             <div class="ratio-inner">
@@ -1043,7 +1248,18 @@ const char* mainPage = R"rawliteral(
             </div>
           </div>
         </div>
-        <button id="drumAirBtn" class="mode-btn">Drum Air</button>
+
+          <button id="hose2StatusBtn" class="hose-status-btn">
+            <div class="hose-label">Hose 2</div>
+            <div class="hose-temp" id="hose2TempDisplay">-- °F</div>
+            <div class="hose-state" id="hose2StateDisplay">OFF</div>
+          </button>
+        </div>
+
+        <div class="btn-row enable-row">
+          <button id="hose1EnableBtn" class="mode-btn"><span class="btn-label">Hose 1</span><span class="btn-sub">Standby!</span></button>
+          <button id="hose2EnableBtn" class="mode-btn"><span class="btn-label">Hose 2</span><span class="btn-sub">Standby!</span></button>
+        </div>
       </div>
 
       <div class="gauge-card large right">
@@ -1055,38 +1271,56 @@ const char* mainPage = R"rawliteral(
     </div>
 
     <!-- Bottom row: smaller low-pressure & air gauges -->
-    <div class="bottom-row">
-      <div class="gauge-card small" id="isoLowCard">
-        <div class="gauge-header">Iso Low</div>
-        <canvas id="isoLowGauge" class="gauge"></canvas>
-        <div class="gauge-value" id="isoLowValue">0 PSI</div>
-        <div class="gauge-value secondary" id="isoLowTempValue">-- °F</div>
-      </div>
+<div class="bottom-row">
+  <div class="gauge-card small" id="isoLowCard">
+    <div class="gauge-header">Iso Low</div>
+    <canvas id="isoLowGauge" class="gauge"></canvas>
+    <div class="gauge-value" id="isoLowValue">0 PSI</div>
+    <div class="gauge-value secondary" id="isoLowTempValue">-- °F</div>
+  </div>
 
-      <div class="gauge-card small">
-        <div class="gauge-header">Primary Air Piston</div>
-        <canvas id="primaryAirGauge" class="gauge"></canvas>
-        <div class="gauge-value" id="primaryAirValue">0 PSI</div>
-      </div>
+  <div class="gauge-card small">
+    <div class="gauge-header">Primary Air Piston</div>
+    <canvas id="primaryAirGauge" class="gauge"></canvas>
+    <div class="gauge-value" id="primaryAirValue">0 PSI</div>
+  </div>
 
-      <div class="gauge-card small">
-        <div class="gauge-header">Gun AP Air</div>
-        <canvas id="gunAirGauge" class="gauge"></canvas>
-        <div class="gauge-value" id="gunAirValue">0 PSI</div>
-      </div>
-
-      <div class="gauge-card small" id="resinLowCard">
-        <div class="gauge-header">Resin Low</div>
-        <canvas id="resinLowGauge" class="gauge"></canvas>
-        <div class="gauge-value" id="resinLowValue">0 PSI</div>
-        <div class="gauge-value secondary" id="resinLowTempValue">-- °F</div>
-      </div>
+  <div class="gauge-card small setpoint-card" id="hose1SetCard">
+    <button class="sp-btn sp-up" id="hose1SetUpBtn">▲</button>
+    <div class="sp-center">
+      <div class="sp-label">Hose Heat 1</div>
+      <div class="sp-value" id="hose1SetValue">-- °F</div>
     </div>
-  </main>
+    <button class="sp-btn sp-down" id="hose1SetDownBtn">▼</button>
+  </div>
+
+  <div class="gauge-card small setpoint-card" id="hose2SetCard">
+    <button class="sp-btn sp-up" id="hose2SetUpBtn">▲</button>
+    <div class="sp-center">
+      <div class="sp-label">Hose Heat 2</div>
+      <div class="sp-value" id="hose2SetValue">-- °F</div>
+    </div>
+    <button class="sp-btn sp-down" id="hose2SetDownBtn">▼</button>
+  </div>
+
+  <div class="gauge-card small">
+    <div class="gauge-header">Gun AP Air</div>
+    <canvas id="gunAirGauge" class="gauge"></canvas>
+    <div class="gauge-value" id="gunAirValue">0 PSI</div>
+  </div>
+
+  <div class="gauge-card small" id="resinLowCard">
+    <div class="gauge-header">Resin Low</div>
+    <canvas id="resinLowGauge" class="gauge"></canvas>
+    <div class="gauge-value" id="resinLowValue">0 PSI</div>
+    <div class="gauge-value secondary" id="resinLowTempValue">-- °F</div>
+  </div>
+</div>
+</main>
 
   <footer>
     <div>Last update: <span id="lastUpdate">--:--:--</span></div>
-    <div class="footer-right">{{FW_VERSION}} • Temp bands + per-gauge targets + relay interlock + alert bar + OTA</div>
+    <div class="footer-right">{{FW_VERSION}} • V2: Hose heat backend (2 zones) + JSON telemetry + relay interlock + OTA</div>
   </footer>
 </div>
 
@@ -2525,6 +2759,54 @@ float applyCalibration(float raw, float R0, float K, float fullScalePsi) {
   return p;
 }
 
+// ---------- Hose heat control logic ----------
+// Simple hysteresis controller:
+//   ON  when temp < (set - tol)
+//   OFF when temp > (set + tol)
+// Disabled or missing sensor => relay OFF.
+
+static inline void applyHoseHeatZone(bool enabled, float tempF, int setF, int tolF, bool& heating, int relayPin)
+{
+  if (!enabled) {
+    heating = false;
+    digitalWrite(relayPin, LOW);
+    return;
+  }
+  if (isnan(tempF)) {
+    heating = false;
+    digitalWrite(relayPin, LOW);
+    return;
+  }
+
+  float low  = (float)setF - (float)tolF;
+  float high = (float)setF + (float)tolF;
+
+  if (!heating && tempF < low) {
+    heating = true;
+  } else if (heating && tempF > high) {
+    heating = false;
+  }
+
+  digitalWrite(relayPin, heating ? HIGH : LOW);
+}
+
+static inline void applyHoseHeatControl()
+{
+  applyHoseHeatZone(hose1Enabled, hose1TempF, hose1SetF, hose1TolF, hose1Heating, RELAY_HOSE1_PIN);
+  applyHoseHeatZone(hose2Enabled, hose2TempF, hose2SetF, hose2TolF, hose2Heating, RELAY_HOSE2_PIN);
+}
+
+static inline const char* hoseStatusText(bool enabled, bool heating, float tempF, int setF, int tolF)
+{
+  if (!enabled) return "OFF";
+  if (isnan(tempF)) return "NO_SENSOR";
+  if (heating) return "HEATING";
+  // not heating, enabled, valid sensor
+  if (fabsf(tempF - (float)setF) <= (float)tolF) return "AT_TEMP";
+  if (tempF > (float)setF + (float)tolF) return "AT_TEMP"; // overshoot is still "at temp" for UI simplification
+  return "AT_TEMP";
+}
+
 // /api/settings
 void handleSettings() {
   if (server.method() == HTTP_GET) {
@@ -2544,6 +2826,14 @@ void handleSettings() {
     doc["resinLowTempTarget"] = resinLowTempTargetF;
     doc["tempMinF"]           = tempMinF;
     doc["tempMaxF"]           = tempMaxF;
+
+    // Hose heat (2 zones)
+    doc["hose1En"]  = hose1Enabled;
+    doc["hose2En"]  = hose2Enabled;
+    doc["hose1Set"] = hose1SetF;
+    doc["hose2Set"] = hose2SetF;
+    doc["hose1Tol"] = hose1TolF;
+    doc["hose2Tol"] = hose2TolF;
 
     doc["wifiMode"] = networkMode;
     doc["apSsid"]   = apSsid;
@@ -2576,6 +2866,24 @@ void handleSettings() {
     resinLowTempTargetF = doc["resinLowTempTarget"] | resinLowTempTargetF;
     tempMinF            = doc["tempMinF"]           | tempMinF;
     tempMaxF            = doc["tempMaxF"]           | tempMaxF;
+
+    // Hose heat settings
+    hose1SetF = doc["hose1Set"] | hose1SetF;
+    hose2SetF = doc["hose2Set"] | hose2SetF;
+    hose1TolF = doc["hose1Tol"] | hose1TolF;
+    hose2TolF = doc["hose2Tol"] | hose2TolF;
+    if (doc["hose1En"].is<bool>()) hose1Enabled = doc["hose1En"];
+    if (doc["hose2En"].is<bool>()) hose2Enabled = doc["hose2En"];
+
+    // Clamp sane ranges
+    if (hose1SetF < 40) hose1SetF = 40;
+    if (hose2SetF < 40) hose2SetF = 40;
+    if (hose1SetF > 200) hose1SetF = 200;
+    if (hose2SetF > 200) hose2SetF = 200;
+    if (hose1TolF < 1) hose1TolF = 1;
+    if (hose2TolF < 1) hose2TolF = 1;
+    if (hose1TolF > 30) hose1TolF = 30;
+    if (hose2TolF > 30) hose2TolF = 30;
 
     if (doc["wifiMode"].is<int>()) {
       networkMode = (int)doc["wifiMode"];
@@ -2615,6 +2923,14 @@ void handleSettings() {
     prefs.putInt("resLowTempTgt",  resinLowTempTargetF);
     prefs.putInt("tempMinF",       tempMinF);
     prefs.putInt("tempMaxF",       tempMaxF);
+
+    // Hose heat settings
+    prefs.putBool("hose1En", hose1Enabled);
+    prefs.putBool("hose2En", hose2Enabled);
+    prefs.putInt("hose1SetF", hose1SetF);
+    prefs.putInt("hose2SetF", hose2SetF);
+    prefs.putInt("hose1TolF", hose1TolF);
+    prefs.putInt("hose2TolF", hose2TolF);
 
     prefs.putInt("wifiMode", networkMode);
     prefs.putString("apSsid",  apSsid);
@@ -2676,7 +2992,54 @@ void handleCalibration() {
     *pR0 = raw0;
     prefs.putFloat((String(sensor) + "_R0").c_str(), *pR0);
     prefs.putFloat((String(sensor) + "_K").c_str(), *pK);
-    out["ok"] = true;
+
+  // Hose heat enable / setpoint / tolerance controls
+  if (doc["hose1En"].is<bool>()) {
+    hose1Enabled = doc["hose1En"];
+    prefs.putBool("hose1En", hose1Enabled);
+    if (!hose1Enabled) {
+      hose1Heating = false;
+      digitalWrite(RELAY_HOSE1_PIN, LOW);
+    }
+  }
+  if (doc["hose2En"].is<bool>()) {
+    hose2Enabled = doc["hose2En"];
+    prefs.putBool("hose2En", hose2Enabled);
+    if (!hose2Enabled) {
+      hose2Heating = false;
+      digitalWrite(RELAY_HOSE2_PIN, LOW);
+    }
+  }
+
+  if (doc["hose1Set"].is<int>()) {
+    hose1SetF = doc["hose1Set"];
+    if (hose1SetF < 40) hose1SetF = 40;
+    if (hose1SetF > 200) hose1SetF = 200;
+    prefs.putInt("hose1SetF", hose1SetF);
+  }
+  if (doc["hose2Set"].is<int>()) {
+    hose2SetF = doc["hose2Set"];
+    if (hose2SetF < 40) hose2SetF = 40;
+    if (hose2SetF > 200) hose2SetF = 200;
+    prefs.putInt("hose2SetF", hose2SetF);
+  }
+  if (doc["hose1Tol"].is<int>()) {
+    hose1TolF = doc["hose1Tol"];
+    if (hose1TolF < 1) hose1TolF = 1;
+    if (hose1TolF > 30) hose1TolF = 30;
+    prefs.putInt("hose1TolF", hose1TolF);
+  }
+  if (doc["hose2Tol"].is<int>()) {
+    hose2TolF = doc["hose2Tol"];
+    if (hose2TolF < 1) hose2TolF = 1;
+    if (hose2TolF > 30) hose2TolF = 30;
+    prefs.putInt("hose2TolF", hose2TolF);
+  }
+
+  // Re-evaluate hose heat immediately after any change
+  applyHoseHeatControl();
+
+  out["ok"]      = true;
     out["raw0"] = raw0;
   } else if (!strcmp(action, "span")) {
     if (!doc["pressure"].is<float>() && !doc["pressure"].is<int>()) {
@@ -2778,6 +3141,10 @@ void handleTempSensors() {
     doc["isoLow"]   = isoLowTempAddrStr;   // Low-side Iso
     doc["resinLow"] = resinLowTempAddrStr; // Low-side Resin
 
+    // Hose heat sensors
+    doc["hose1"]   = hose1TempAddrStr;
+    doc["hose2"]   = hose2TempAddrStr;
+
     String out;
     serializeJson(doc, out);
     server.send(200, "application/json", out);
@@ -2794,21 +3161,35 @@ void handleTempSensors() {
     const char* resinStr    = doc["resin"]    | "";
     const char* isoLowStr   = doc["isoLow"]   | "";
     const char* resinLowStr = doc["resinLow"] | "";
+    const char* hose1Str   = doc["hose1"]   | "";
+    const char* hose2Str   = doc["hose2"]   | "";
 
     isoTempAddrStr      = String(isoStr);
     resinTempAddrStr    = String(resinStr);
     isoLowTempAddrStr   = String(isoLowStr);
     resinLowTempAddrStr = String(resinLowStr);
 
+    hose1TempAddrStr    = String(hose1Str);
+    hose2TempAddrStr    = String(hose2Str);
+
     isoTempAssigned      = parseAddressString(isoTempAddrStr,      isoTempAddr);
     resinTempAssigned    = parseAddressString(resinTempAddrStr,    resinTempAddr);
     isoLowTempAssigned   = parseAddressString(isoLowTempAddrStr,   isoLowTempAddr);
     resinLowTempAssigned = parseAddressString(resinLowTempAddrStr, resinLowTempAddr);
 
+    hose1TempAssigned = parseAddressString(hose1TempAddrStr, hose1TempAddr);
+    hose2TempAssigned = parseAddressString(hose2TempAddrStr, hose2TempAddr);
+
+  hose1TempAssigned = parseAddressString(hose1TempAddrStr, hose1TempAddr);
+  hose2TempAssigned = parseAddressString(hose2TempAddrStr, hose2TempAddr);
+
     prefs.putString("isoTempAddr",    isoTempAddrStr);
     prefs.putString("resTempAddr",    resinTempAddrStr);
     prefs.putString("isoLowTempAddr", isoLowTempAddrStr);
     prefs.putString("resLowTempAddr", resinLowTempAddrStr);
+
+    prefs.putString("hose1TempAddr", hose1TempAddrStr);
+    prefs.putString("hose2TempAddr", hose2TempAddrStr);
 
     Serial.println("=== Temp assignments UPDATED via /api/temp-sensors ===");
     printDS18B20Addresses();
@@ -2830,6 +3211,18 @@ void handleControl() {
     JsonDocument doc;
     doc["drumAir"] = drumAirEnabled;
     doc["spray"]   = sprayEnabled;
+    doc["hose1En"] = hose1Enabled;
+    doc["hose2En"] = hose2Enabled;
+    doc["hose1Heat"] = hose1Heating;
+    doc["hose2Heat"] = hose2Heating;
+    doc["hose1Set"] = hose1SetF;
+    doc["hose2Set"] = hose2SetF;
+    doc["hose1Tol"] = hose1TolF;
+    doc["hose2Tol"] = hose2TolF;
+    if (!isnan(hose1TempF)) doc["hose1Temp"] = round1(hose1TempF);
+    if (!isnan(hose2TempF)) doc["hose2Temp"] = round1(hose2TempF);
+    doc["hose1Status"] = hoseStatusText(hose1Enabled, hose1Heating, hose1TempF, hose1SetF, hose1TolF);
+    doc["hose2Status"] = hoseStatusText(hose2Enabled, hose2Heating, hose2TempF, hose2SetF, hose2TolF);
     String s;
     serializeJson(doc, s);
     server.send(200, "application/json", s);
@@ -2876,8 +3269,18 @@ void handleControl() {
 
         out["ok"]        = false;
         out["error"]     = "Low supply pressure";
-        out["drumAir"]   = drumAirEnabled;
-        out["spray"]     = sprayEnabled;
+        out["drumAir"] = drumAirEnabled;
+  out["spray"]   = sprayEnabled;
+  out["hose1En"] = hose1Enabled;
+  out["hose2En"] = hose2Enabled;
+  out["hose1Heat"] = hose1Heating;
+  out["hose2Heat"] = hose2Heating;
+  out["hose1Set"] = hose1SetF;
+  out["hose2Set"] = hose2SetF;
+  out["hose1Tol"] = hose1TolF;
+  out["hose2Tol"] = hose2TolF;
+  out["hose1Status"] = hoseStatusText(hose1Enabled, hose1Heating, hose1TempF, hose1SetF, hose1TolF);
+  out["hose2Status"] = hoseStatusText(hose2Enabled, hose2Heating, hose2TempF, hose2SetF, hose2TolF);
         out["interlock"] = lastInterlockReason;
         String s;
         serializeJson(out, s);
@@ -2995,8 +3398,12 @@ void setup() {
   // Relay outputs
   pinMode(RELAY_SPRAY_PIN, OUTPUT);
   pinMode(RELAY_DRUM_AIR_PIN, OUTPUT);
+  pinMode(RELAY_HOSE1_PIN, OUTPUT);
+  pinMode(RELAY_HOSE2_PIN, OUTPUT);
   digitalWrite(RELAY_SPRAY_PIN, LOW);
   digitalWrite(RELAY_DRUM_AIR_PIN, LOW);
+  digitalWrite(RELAY_HOSE1_PIN, LOW);
+  digitalWrite(RELAY_HOSE2_PIN, LOW);
   // Hose-tip LED (PWM)
   hoseLedInit();
   tempSensors.begin();
@@ -3018,6 +3425,15 @@ void setup() {
   tempMinF            = prefs.getInt("tempMinF",        40);
   tempMaxF            = prefs.getInt("tempMaxF",        180);
 
+  // Hose heat (2 zones)
+  hose1Enabled = prefs.getBool("hose1En", false);
+  hose2Enabled = prefs.getBool("hose2En", false);
+  hose1SetF    = prefs.getInt("hose1SetF", 125);
+  hose2SetF    = prefs.getInt("hose2SetF", 125);
+  hose1TolF    = prefs.getInt("hose1TolF", 3);
+  hose2TolF    = prefs.getInt("hose2TolF", 3);
+
+
   isoR0   = prefs.getFloat("iso_R0",   0.0f);
   isoK    = prefs.getFloat("iso_K",    1.0f);
   resinR0 = prefs.getFloat("resin_R0", 0.0f);
@@ -3035,6 +3451,9 @@ void setup() {
   resinTempAddrStr    = prefs.getString("resTempAddr",    "");
   isoLowTempAddrStr   = prefs.getString("isoLowTempAddr", "");
   resinLowTempAddrStr = prefs.getString("resLowTempAddr", "");
+
+  hose1TempAddrStr    = prefs.getString("hose1TempAddr", "");
+  hose2TempAddrStr    = prefs.getString("hose2TempAddr", "");
 
   isoTempAssigned      = parseAddressString(isoTempAddrStr,      isoTempAddr);
   resinTempAssigned    = parseAddressString(resinTempAddrStr,    resinTempAddr);
@@ -3432,7 +3851,10 @@ void loop() {
       hoseLedMode = HOSE_LED_SOLID;
     }
 
-// Build status JSON for WebSocket + HMI UART (ArduinoJson)
+    // Update hose heat relays/state before we publish status
+    applyHoseHeatControl();
+
+    // Build status JSON for WebSocket + HMI UART (ArduinoJson)
     JsonDocument doc;
 
     // Pressures
@@ -3452,6 +3874,20 @@ void loop() {
     // Relay / mode states (0/1 so JS + LVGL can treat them as booleans)
     doc["drumAir"] = drumAirEnabled ? 1 : 0;
     doc["spray"]   = sprayEnabled   ? 1 : 0;
+
+    // Hose heat (2 zones)
+    doc["hose1En"]   = hose1Enabled ? 1 : 0;
+    doc["hose2En"]   = hose2Enabled ? 1 : 0;
+    doc["hose1Heat"] = hose1Heating ? 1 : 0;
+    doc["hose2Heat"] = hose2Heating ? 1 : 0;
+    doc["hose1Set"]  = hose1SetF;
+    doc["hose2Set"]  = hose2SetF;
+    doc["hose1Tol"]  = hose1TolF;
+    doc["hose2Tol"]  = hose2TolF;
+    if (!isnan(hose1TempF)) doc["hose1Temp"] = round1(hose1TempF);
+    if (!isnan(hose2TempF)) doc["hose2Temp"] = round1(hose2TempF);
+    doc["hose1Status"] = hoseStatusText(hose1Enabled, hose1Heating, hose1TempF, hose1SetF, hose1TolF);
+    doc["hose2Status"] = hoseStatusText(hose2Enabled, hose2Heating, hose2TempF, hose2SetF, hose2TolF);
 
     // Firmware and configuration (mirrors the web UI expectations)
     doc["fw"]             = FW_VERSION;
@@ -3570,6 +4006,20 @@ void loop() {
         resinLowTempF = tC * 9.0f / 5.0f + 32.0f;
       }
     }
+    if (hose1TempAssigned) {
+      float tC = tempSensors.getTempC(hose1TempAddr);
+      if (tC > -100.0f) {
+        hose1TempF = tC * 9.0f / 5.0f + 32.0f;
+      }
+    }
+
+    if (hose2TempAssigned) {
+      float tC = tempSensors.getTempC(hose2TempAddr);
+      if (tC > -100.0f) {
+        hose2TempF = tC * 9.0f / 5.0f + 32.0f;
+      }
+    }
+
 
     lastTempRead = now;
   }
