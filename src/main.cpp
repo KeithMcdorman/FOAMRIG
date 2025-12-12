@@ -86,6 +86,36 @@ const char* FW_VERSION = "V1.4";
 //  - Slow blink: Iso HP below green band
 //  - Fast blink: Iso HP above band (above setpoint area)
 #define HOSE_LED_PIN 23
+#define HOSE_LED_LEDC_CH   6
+#define HOSE_LED_LEDC_FREQ 5000
+#define HOSE_LED_LEDC_BITS 8
+#define HOSE_LED_MAX_DUTY  ((1 << HOSE_LED_LEDC_BITS) - 1)
+// Compatibility wrapper for Arduino-ESP32 LEDC API changes (v2 vs v3+)
+#ifndef ESP_ARDUINO_VERSION_MAJOR
+  #define ESP_ARDUINO_VERSION_MAJOR 2
+#endif
+
+#if ESP_ARDUINO_VERSION_MAJOR >= 3
+static inline void hoseLedInit() {
+  // New API: ledcAttach(pin, freq, resolution_bits)
+  ledcAttach(HOSE_LED_PIN, HOSE_LED_LEDC_FREQ, HOSE_LED_LEDC_BITS);
+  ledcWrite(HOSE_LED_PIN, 0);
+}
+static inline void hoseLedWrite(uint32_t duty) {
+  ledcWrite(HOSE_LED_PIN, duty);
+}
+#else
+static inline void hoseLedInit() {
+  // Legacy API: ledcSetup(channel, freq, resolution_bits) + ledcAttachPin(pin, channel)
+  ledcSetup(HOSE_LED_LEDC_CH, HOSE_LED_LEDC_FREQ, HOSE_LED_LEDC_BITS);
+  ledcAttachPin(HOSE_LED_PIN, HOSE_LED_LEDC_CH);
+  hoseLedWrite(0);
+}
+static inline void hoseLedWrite(uint32_t duty) {
+  hoseLedWrite(duty);
+}
+#endif
+
 
 // ---------- DS18B20 temperature support ----------
 // NOTE: bus moved from 27 to 18 to free 27 for relays/IO
@@ -144,6 +174,28 @@ Preferences      prefs;
 HardwareSerial HMISerial(2);
 static String hmiRxBuffer;
 
+// Last status JSON for HTTP fallback (/api/live)
+static String lastStatusJson;
+
+
+
+// ---------- JSON helpers (ArduinoJson) ----------
+// Keep telemetry JSON creation robust and future-proof as fields expand.
+// Avoid ad-hoc String concatenation to prevent subtle formatting bugs.
+static inline float round1(float v) {
+  if (isnan(v)) return v;
+  return roundf(v * 10.0f) / 10.0f;
+}
+
+// Capacity for the live status payload (pressures, temps, relay states, config, interlock).
+// If you add lots of new fields later (e.g., hose heat zones), bump this.
+// JSON_OBJECT_SIZE(32) is 704 bytes; we add headroom for strings and growth.
+static constexpr size_t STATUS_JSON_DOC_CAP = 2048;
+static constexpr size_t STATUS_JSON_OUT_MAX = 1024;
+static char statusJsonBuf[STATUS_JSON_OUT_MAX];
+
+
+
 // Global settings (loaded from Preferences)
 int  targetPressure = 1000;
 int  marginPercent  = 10;
@@ -198,10 +250,11 @@ enum HoseLedMode {
   HOSE_LED_OFF        = 0,
   HOSE_LED_SOLID      = 1,
   HOSE_LED_BLINK_SLOW = 2,
-  HOSE_LED_BLINK_FAST = 3
+  HOSE_LED_BLINK_FAST = 3,
+  HOSE_LED_PULSE      = 4
 };
 
-HoseLedMode hoseLedMode = HOSE_LED_OFF;
+HoseLedMode hoseLedMode = HOSE_LED_PULSE;
 
 // ---------- Interlock state ----------
 bool   sprayInterlockActive = false;
@@ -1618,12 +1671,25 @@ const char* mainPage = R"rawliteral(
     });
   });
 
+  
+  // Shared WebSocket instance with auto-reconnect
+  var ws = null;
+
   function connectWS() {
-    var ws = new WebSocket('ws://' + location.hostname + ':81/');
-    ws.onopen = function() {
+    // Avoid creating multiple sockets if one is already open/connecting
+    if (ws && (ws.readyState === WebSocket.OPEN || ws.readyState === WebSocket.CONNECTING)) {
+      return;
+    }
+
+    var scheme = (location.protocol === 'https:') ? 'wss://' : 'ws://';
+    ws = new WebSocket(scheme + location.hostname + ':81/');
+
+    ws.onopen = function () {
+      console.log('WS connected');
       setLiveStatus(true);
     };
-    ws.onmessage = function(ev) {
+
+    ws.onmessage = function (ev) {
       try {
         var d = JSON.parse(ev.data);
         updateGauges(d);
@@ -1631,12 +1697,18 @@ const char* mainPage = R"rawliteral(
         console.log('Bad WS payload', e);
       }
     };
-    ws.onclose = function() {
+
+    ws.onclose = function () {
+      console.log('WS closed, scheduling reconnect');
       setLiveStatus(false);
+      ws = null;
       setTimeout(connectWS, 1500);
     };
-    ws.onerror = function() {
+
+    ws.onerror = function (err) {
+      console.log('WS error', err);
       setLiveStatus(false);
+      try { ws.close(); } catch (e) {}
     };
   }
 
@@ -1649,7 +1721,7 @@ const char* mainPage = R"rawliteral(
     console.log('Failed to load relay state:', e);
   });
 
-  connectWS();
+  window.addEventListener('load', connectWS);
 </script>
 </body>
 </html>
@@ -2663,6 +2735,17 @@ void handleCalibrationStatus() {
   server.send(200, "application/json", s);
 }
 
+// /api/live - return the latest status JSON we broadcast to WebSocket/HMI
+void handleLiveStatus() {
+  if (lastStatusJson.length() == 0) {
+    // Not ready yet; no status built
+    server.send(503, "application/json", "{}");
+    return;
+  }
+  server.send(200, "application/json", lastStatusJson);
+}
+
+
 // /api/temp-sensors
 void handleTempSensors() {
   if (server.method() == HTTP_GET) {
@@ -2914,11 +2997,8 @@ void setup() {
   pinMode(RELAY_DRUM_AIR_PIN, OUTPUT);
   digitalWrite(RELAY_SPRAY_PIN, LOW);
   digitalWrite(RELAY_DRUM_AIR_PIN, LOW);
-
-   // Hose-tip LED
-  pinMode(HOSE_LED_PIN, OUTPUT);
-  digitalWrite(HOSE_LED_PIN, LOW);
-
+  // Hose-tip LED (PWM)
+  hoseLedInit();
   tempSensors.begin();
 
   prefs.begin("foam", false);
@@ -2984,6 +3064,7 @@ void setup() {
   server.on("/calibration/status", HTTP_GET, handleCalibrationStatus);
   server.on("/api/temp-sensors", handleTempSensors);
   server.on("/api/control", handleControl);
+  server.on("/api/live", HTTP_GET, handleLiveStatus);
 
   // OTA endpoints
   server.on("/update", HTTP_GET, handleUpdatePage);
@@ -3110,121 +3191,10 @@ void setup() {
 
 
 // -----------------------------------------------------------------------------
-// HMI UART command handling
+// HMI UART polling and button handling (no JSON dependency)
 // -----------------------------------------------------------------------------
 
-// Handle a parsed JSON command coming from the HMI
-void hmiHandleCommand(const JsonDocument &doc)
-{
-  // HMI may send either:
-  //   [{"cmd":"spray","value":1}]
-  // or:
-  //   {"cmd":"spray","value":1}
-  //
-  // We treat root as:
-  //   - element 0 if it's an array
-  //   - otherwise the document itself
-
-  JsonVariantConst obj;
-
-  JsonVariantConst first = doc[0];  // if root is array, this is element 0; otherwise null
-  if (!first.isNull()) {
-    obj = first;
-  } else {
-    obj = doc;  // treat root as object
-  }
-
-  if (!obj.is<JsonObject>()) {
-    return;
-  }
-
-  // cmd must be a string
-  if (!obj["cmd"].is<const char*>()) {
-    return;
-  }
-  const char *cmd = obj["cmd"].as<const char*>();
-  if (!cmd) return;
-
-  // Treat "value" / "state" as a momentary press indicator.
-  // We only act when it's true/non‑zero.
-  bool pressed = true;  // default: if no field, assume press
-  if (obj["state"].is<bool>()) {
-    pressed = obj["state"].as<bool>();
-  } else if (obj["value"].is<bool>()) {
-    pressed = obj["value"].as<bool>();
-  } else if (obj["value"].is<int>()) {
-    pressed = (obj["value"].as<int>() != 0);
-  } else if (obj["value"].is<float>()) {
-    pressed = (obj["value"].as<float>() != 0.0f);
-  }
-
-  if (!pressed) {
-    return;  // ignore "no‑press" messages
-  }
-
-  bool isSprayCmd =
-      (strcmp(cmd, "setSpray") == 0) ||
-      (strcmp(cmd, "spray")    == 0);
-
-  bool isDrumCmd =
-      (strcmp(cmd, "setDrumAir") == 0) ||
-      (strcmp(cmd, "setDrum")    == 0) ||
-      (strcmp(cmd, "drum")       == 0);
-
-  // -------- Drum Air control (toggle) --------
-  if (isDrumCmd) {
-    bool desired = !drumAirEnabled;   // toggle
-    drumAirEnabled = desired;
-    digitalWrite(RELAY_DRUM_AIR_PIN, drumAirEnabled ? HIGH : LOW);
-
-    // If you kill drum air, also drop spray as a safety
-    if (!drumAirEnabled) {
-      sprayEnabled = false;
-      digitalWrite(RELAY_SPRAY_PIN, LOW);
-    }
-    return;
-  }
-
-  // -------- Spray control (toggle with same interlocks as /api/control) --------
-  if (isSprayCmd) {
-    bool desired = !sprayEnabled;  // toggle
-
-    if (desired) {
-      // Guard: require both low sides above threshold
-      if (!(lastIsoLowPSI >= supplyLowPSI && lastResinLowPSI >= supplyLowPSI)) {
-        sprayInterlockActive = true;
-        lastInterlockReason  = "Interlock: low supply pressure on feed side.";
-        sprayEnabled         = false;
-        digitalWrite(RELAY_SPRAY_PIN, LOW);
-        return;
-      }
-
-      // Guard: require drum air
-      if (!drumAirEnabled) {
-        sprayInterlockActive = true;
-        lastInterlockReason  = "Interlock: drum air not enabled.";
-        sprayEnabled         = false;
-        digitalWrite(RELAY_SPRAY_PIN, LOW);
-        return;
-      }
-
-      // Preconditions OK – enable spray and clear any latched interlock
-      sprayEnabled         = true;
-      digitalWrite(RELAY_SPRAY_PIN, HIGH);
-      sprayInterlockActive = false;
-      lastInterlockReason  = "";
-    } else {
-      // Just turn spray off
-      sprayEnabled = false;
-      digitalWrite(RELAY_SPRAY_PIN, LOW);
-    }
-    return;
-  }
-
-  // Unknown cmd – ignore for now
-}
-
-// Read bytes from HMISerial, assemble into newline‑terminated JSON lines
+// Read bytes from HMISerial, assemble into newline-terminated lines
 void hmiPollUart()
 {
   while (HMISerial.available() > 0) {
@@ -3240,26 +3210,146 @@ void hmiPollUart()
       }
 
       // Debug: show exactly what we received
-      Serial.print("HMI RX line: [");
+      Serial.print("RX line: [");
       Serial.print(hmiRxBuffer);
       Serial.println("]");
 
-      // Basic sanity: if it doesn't start with '{' or '[', it is not JSON
+      // Parse JSON commands from the HMI (ArduinoJson)
       char first = hmiRxBuffer[0];
-      if (first != '{' && first != '[') {
-        Serial.println("HMI line ignored (does not look like JSON)");
-        hmiRxBuffer = "";
-        continue;
-      }
+      if (first == '{') {
+        JsonDocument cmdDoc;
+        DeserializationError jerr = deserializeJson(cmdDoc, hmiRxBuffer);
 
-      StaticJsonDocument<256> doc;
-      DeserializationError err = deserializeJson(doc, hmiRxBuffer);
+        if (!jerr) {
+          // Option A (legacy): {"cmd":"drum"} / {"cmd":"spray"} = toggle
+          const char* cmd = cmdDoc["cmd"] | "";
 
-      if (err) {
-        Serial.print("HMI JSON parse error: ");
-        Serial.println(err.c_str());
-      } else {
-        hmiHandleCommand(doc);
+          bool handled = false;
+
+          if (cmd[0] != '\0') {
+            if (!strcmp(cmd, "drum")) {
+              bool desired = !drumAirEnabled;   // toggle
+              drumAirEnabled = desired;
+              digitalWrite(RELAY_DRUM_AIR_PIN, drumAirEnabled ? HIGH : LOW);
+
+              Serial.printf("HMI DRUM(cmd) -> drumAir=%d, spray=%d\n",
+                            drumAirEnabled, sprayEnabled);
+
+              // If you kill drum air, also drop spray as a safety
+              if (!drumAirEnabled) {
+                sprayEnabled = false;
+                digitalWrite(RELAY_SPRAY_PIN, LOW);
+              }
+
+              handled = true;
+            }
+            else if (!strcmp(cmd, "spray")) {
+              bool desired = !sprayEnabled;   // toggle
+
+              if (desired) {
+                // Turning spray ON: apply same interlocks as /api/control
+
+                // Guard: low-side supply must be above threshold
+                if (!(lastIsoLowPSI >= supplyLowPSI &&
+                      lastResinLowPSI >= supplyLowPSI)) {
+                  sprayInterlockActive = true;
+                  lastInterlockReason  = "Interlock: low supply pressure on feed side.";
+                  sprayEnabled         = false;
+                  digitalWrite(RELAY_SPRAY_PIN, LOW);
+                  Serial.println("HMI SPRAY(cmd) -> BLOCKED (low supply)");
+                }
+                // Guard: drum air must be enabled
+                else if (!drumAirEnabled) {
+                  sprayInterlockActive = true;
+                  lastInterlockReason  = "Interlock: drum air not enabled.";
+                  sprayEnabled         = false;
+                  digitalWrite(RELAY_SPRAY_PIN, LOW);
+                  Serial.println("HMI SPRAY(cmd) -> BLOCKED (drum air off)");
+                }
+                else {
+                  // Preconditions OK – enable spray and clear interlock
+                  sprayEnabled         = true;
+                  digitalWrite(RELAY_SPRAY_PIN, HIGH);
+                  sprayInterlockActive = false;
+                  lastInterlockReason  = "";
+                  Serial.printf("HMI SPRAY(cmd) -> spray=%d, drumAir=%d\n",
+                                sprayEnabled, drumAirEnabled);
+                }
+              } else {
+                // Turning spray OFF
+                sprayEnabled = false;
+                digitalWrite(RELAY_SPRAY_PIN, LOW);
+                Serial.printf("HMI SPRAY(cmd) -> spray=%d, drumAir=%d\n",
+                              sprayEnabled, drumAirEnabled);
+              }
+
+              handled = true;
+            }
+          }
+
+          // Option B (preferred going-forward): explicit keys like the web UI
+          // {"drumAir":true} and/or {"spray":true}
+          if (!handled) {
+            if (cmdDoc["drumAir"].is<bool>()) {
+              bool desired = cmdDoc["drumAir"];
+              drumAirEnabled = desired;
+              digitalWrite(RELAY_DRUM_AIR_PIN, drumAirEnabled ? HIGH : LOW);
+
+              if (!drumAirEnabled) {
+                sprayEnabled = false;
+                digitalWrite(RELAY_SPRAY_PIN, LOW);
+              }
+
+              Serial.printf("HMI drumAir -> drumAir=%d, spray=%d\n",
+                            drumAirEnabled, sprayEnabled);
+              handled = true;
+            }
+
+            if (cmdDoc["spray"].is<bool>()) {
+              bool desired = cmdDoc["spray"];
+
+              if (desired) {
+                if (!(lastIsoLowPSI >= supplyLowPSI &&
+                      lastResinLowPSI >= supplyLowPSI)) {
+                  sprayInterlockActive = true;
+                  lastInterlockReason  = "Interlock: low supply pressure on feed side.";
+                  sprayEnabled         = false;
+                  digitalWrite(RELAY_SPRAY_PIN, LOW);
+                  Serial.println("HMI spray -> BLOCKED (low supply)");
+                }
+                else if (!drumAirEnabled) {
+                  sprayInterlockActive = true;
+                  lastInterlockReason  = "Interlock: drum air not enabled.";
+                  sprayEnabled         = false;
+                  digitalWrite(RELAY_SPRAY_PIN, LOW);
+                  Serial.println("HMI spray -> BLOCKED (drum air off)");
+                }
+                else {
+                  sprayEnabled         = true;
+                  digitalWrite(RELAY_SPRAY_PIN, HIGH);
+                  sprayInterlockActive = false;
+                  lastInterlockReason  = "";
+                  Serial.printf("HMI spray -> spray=%d, drumAir=%d\n",
+                                sprayEnabled, drumAirEnabled);
+                }
+              } else {
+                sprayEnabled = false;
+                digitalWrite(RELAY_SPRAY_PIN, LOW);
+                Serial.printf("HMI spray -> spray=%d, drumAir=%d\n",
+                              sprayEnabled, drumAirEnabled);
+              }
+
+              handled = true;
+            }
+          }
+
+          if (!handled) {
+            Serial.println("HMI JSON parsed, but no recognized cmd/keys.");
+          }
+        } else {
+          Serial.print("HMI JSON parse error: ");
+          Serial.println(jerr.c_str());
+        }
       }
 
       // Reset buffer for next line
@@ -3320,22 +3410,7 @@ void loop() {
       lastInterlockReason  = "Interlock: low supply pressure on feed side.";
     }
 
-    // --- decide hoseLedMode based on Iso HP and green band ---
-    float bandMargin = targetPressure * (marginPercent / 100.0f);
-    float bandLow  = targetPressure - bandMargin;
-    float bandHigh = targetPressure + bandMargin;
-
-    if (isoPSI <= 0.0f) {
-      hoseLedMode = HOSE_LED_OFF;              // rig idle
-    } else if (isoPSI < bandLow) {
-      hoseLedMode = HOSE_LED_BLINK_SLOW;       // below green band
-    } else if (isoPSI <= bandHigh) {
-      hoseLedMode = HOSE_LED_SOLID;            // inside green band
-    } else {
-      hoseLedMode = HOSE_LED_BLINK_FAST;       // above setpoint/band
-    }
-
-        // Update hose-tip LED mode based on Iso high pressure vs green band
+    // --- Hose-tip LED mode based on Iso HP vs green band ---
     float bandFrac = marginPercent / 100.0f;
     if (bandFrac < 0.0f) bandFrac = 0.0f;
     if (bandFrac > 1.0f) bandFrac = 1.0f;
@@ -3343,59 +3418,79 @@ void loop() {
     float isoBandLow  = targetPressure * (1.0f - bandFrac);
     float isoBandHigh = targetPressure * (1.0f + bandFrac);
 
-    if (isoPSI < isoBandLow) {
+    if (isoPSI <= 0.0f) {
+      // Rig idle
+      hoseLedMode = HOSE_LED_OFF;
+    } else if (isoPSI < isoBandLow) {
       // Below green band → slow blink
       hoseLedMode = HOSE_LED_BLINK_SLOW;
     } else if (isoPSI > isoBandHigh) {
-      // Above band / setpoint → fast blink
+      // Above green band / setpoint → fast blink
       hoseLedMode = HOSE_LED_BLINK_FAST;
     } else {
       // Within green band → solid
       hoseLedMode = HOSE_LED_SOLID;
     }
 
-    String json = "{\"iso\":"      + String(isoPSI,1) +
-                  ",\"resin\":"    + String(resinPSI,1) +
-                  ",\"isoLow\":"   + String(isoLowPSI,1) +
-                  ",\"resinLow\":" + String(resinLowPSI,1) +
-                  ",\"airPiston\":"+ String(airPistonPSI,1) +
-                  ",\"apAir\":"    + String(apAirPSI,1);
+// Build status JSON for WebSocket + HMI UART (ArduinoJson)
+    JsonDocument doc;
 
-    if (!isnan(isoTempF)) {
-      json += ",\"isoTemp\":" + String(isoTempF,1);
-    }
-    if (!isnan(resinTempF)) {
-      json += ",\"resinTemp\":" + String(resinTempF,1);
-    }
-    if (!isnan(isoLowTempF)) {
-      json += ",\"isoLowTemp\":" + String(isoLowTempF,1);
-    }
-    if (!isnan(resinLowTempF)) {
-      json += ",\"resinLowTemp\":" + String(resinLowTempF,1);
-    }
+    // Pressures
+    doc["iso"]      = round1(isoPSI);
+    doc["resin"]    = round1(resinPSI);
+    doc["isoLow"]   = round1(isoLowPSI);
+    doc["resinLow"] = round1(resinLowPSI);
+    doc["airPiston"]= round1(airPistonPSI);
+    doc["apAir"]    = round1(apAirPSI);
 
-    json += ",\"drumAir\":"; json += drumAirEnabled ? "1" : "0";
-    json += ",\"spray\":";   json += sprayEnabled   ? "1" : "0";
+    // Temps (only include when valid)
+    if (!isnan(isoTempF))       doc["isoTemp"]      = round1(isoTempF);
+    if (!isnan(resinTempF))     doc["resinTemp"]    = round1(resinTempF);
+    if (!isnan(isoLowTempF))    doc["isoLowTemp"]   = round1(isoLowTempF);
+    if (!isnan(resinLowTempF))  doc["resinLowTemp"] = round1(resinLowTempF);
+
+    // Relay / mode states (0/1 so JS + LVGL can treat them as booleans)
+    doc["drumAir"] = drumAirEnabled ? 1 : 0;
+    doc["spray"]   = sprayEnabled   ? 1 : 0;
+
+    // Firmware and configuration (mirrors the web UI expectations)
+    doc["fw"]             = FW_VERSION;
+    doc["target"]         = targetPressure;
+    doc["margin"]         = marginPercent;
+    doc["diff"]           = diffPressure;
+    doc["airTarget"]      = airTarget;
+    doc["gunTarget"]      = gunTarget;
+    doc["isoLowTarget"]   = isoLowTarget;
+    doc["resinLowTarget"] = resinLowTarget;
+    doc["supplyLow"]      = supplyLowPSI;
+
+    doc["isoTempTarget"]      = isoTempTargetF;
+    doc["resinTempTarget"]    = resinTempTargetF;
+    doc["isoLowTempTarget"]   = isoLowTempTargetF;
+    doc["resinLowTempTarget"] = resinLowTempTargetF;
+    doc["tempMinF"]           = tempMinF;
+    doc["tempMaxF"]           = tempMaxF;
 
     // Always include an interlock field so the UI can clear the red state
-    json += ",\"interlock\":";
     if (sprayInterlockActive && lastInterlockReason.length() > 0) {
-      String safeReason = lastInterlockReason;
-      safeReason.replace("\"", "'");
-      json += "\"";
-      json += safeReason;
-      json += "\"";
+      doc["interlock"] = lastInterlockReason;
     } else {
-      json += "null";
+      doc["interlock"] = nullptr;
     }
 
-    json += "}";
-    webSocket.broadcastTXT(json);
-    HMISerial.println(json);
+    size_t n = serializeJson(doc, statusJsonBuf, sizeof(statusJsonBuf));
+    if (n > 0) {
+      lastStatusJson = statusJsonBuf;
+      webSocket.broadcastTXT(statusJsonBuf, n);
+      HMISerial.write((const uint8_t*)statusJsonBuf, n);
+      HMISerial.write('\n');
+    }
+
     last = now;
   }
 
-    // --- Drive hose-tip LED according to hoseLedMode ---
+
+// --- Drive hose-tip LED according to hoseLedMode ---
   static bool hoseLedState = false;
   static unsigned long lastHoseLedToggle = 0;
 
@@ -3404,7 +3499,7 @@ void loop() {
   switch (hoseLedMode) {
     case HOSE_LED_SOLID:
       // Solid ON whenever Iso HP is inside green band
-      digitalWrite(HOSE_LED_PIN, HIGH);
+      hoseLedWrite(HOSE_LED_MAX_DUTY);
       hoseLedState = true;
       break;
 
@@ -3418,9 +3513,21 @@ void loop() {
       interval = 220; // ms
       break;
 
+    case HOSE_LED_PULSE: {
+      // Rig standby: slow "breathing" pulse for controller-alive feedback
+      static const uint32_t periodMs = 2600; // full fade in+out
+      uint32_t t = now % periodMs;
+      float phase = (float)t / (float)periodMs;                 // 0..1
+      float level = 0.5f - 0.5f * cosf(6.2831853f * phase);     // 0..1
+      uint32_t duty = (uint32_t)(level * (float)HOSE_LED_MAX_DUTY + 0.5f);
+      hoseLedWrite(duty);
+      hoseLedState = (duty > 0);
+      break;
+    }
+
     case HOSE_LED_OFF:
     default:
-      digitalWrite(HOSE_LED_PIN, LOW);
+      hoseLedWrite(0);
       hoseLedState = false;
       break;
   }
@@ -3428,11 +3535,10 @@ void loop() {
   if (hoseLedMode == HOSE_LED_BLINK_SLOW || hoseLedMode == HOSE_LED_BLINK_FAST) {
     if (now - lastHoseLedToggle >= interval) {
       hoseLedState = !hoseLedState;
-      digitalWrite(HOSE_LED_PIN, hoseLedState ? HIGH : LOW);
+      hoseLedWrite(hoseLedState ? HOSE_LED_MAX_DUTY : 0);
       lastHoseLedToggle = now;
     }
   }
-
   // Temp read every ~1 s using assigned ROM addresses (no auto-pick)
   if (now - lastTempRead > 1000) {
     tempSensors.requestTemperatures();
