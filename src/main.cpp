@@ -1352,6 +1352,18 @@ const char* mainPage = R"rawliteral(
   var drumAir = false;
   var spray   = false;
 
+  // Hose heat (live page)
+  var hose1En   = false;
+  var hose2En   = false;
+  var hose1Heat = false;
+  var hose2Heat = false;
+  var hose1Temp = null;
+  var hose2Temp = null;
+  var hose1Set  = null;
+  var hose2Set  = null;
+  var hose1Tol  = null;
+  var hose2Tol  = null;
+
   var lastIsoLow   = 0;
   var lastResinLow = 0;
 
@@ -1751,6 +1763,137 @@ const char* mainPage = R"rawliteral(
     }
   }
 
+
+  function fmtTempF(v) {
+    if (v === null || v === undefined) return '-- °F';
+    var n = Number(v);
+    if (!isFinite(n)) return '-- °F';
+    return n.toFixed(1) + ' °F';
+  }
+
+  function fmtSetF(v) {
+    if (v === null || v === undefined) return '-- °F';
+    var n = Math.round(Number(v));
+    if (!isFinite(n)) return '-- °F';
+    return n + ' °F';
+  }
+
+  function normalizeHoseState(en, heat) {
+    if (!en) return 'OFF';
+    return heat ? 'HEATING!' : 'AT TEMP';
+  }
+
+  function updateHoseUI() {
+    // Enable buttons
+    var h1EnBtn = document.getElementById('hose1EnableBtn');
+    var h2EnBtn = document.getElementById('hose2EnableBtn');
+
+    if (h1EnBtn) {
+      if (hose1En) h1EnBtn.classList.add('on'); else h1EnBtn.classList.remove('on');
+      var sub = h1EnBtn.querySelector('.btn-sub');
+      if (sub) sub.textContent = hose1En ? 'ON' : 'Standby!';
+    }
+    if (h2EnBtn) {
+      if (hose2En) h2EnBtn.classList.add('on'); else h2EnBtn.classList.remove('on');
+      var sub2 = h2EnBtn.querySelector('.btn-sub');
+      if (sub2) sub2.textContent = hose2En ? 'ON' : 'Standby!';
+    }
+
+    // Status buttons
+    var h1StatusBtn = document.getElementById('hose1StatusBtn');
+    var h2StatusBtn = document.getElementById('hose2StatusBtn');
+    if (h1StatusBtn) {
+      if (hose1En && hose1Heat) h1StatusBtn.classList.add('heating'); else h1StatusBtn.classList.remove('heating');
+      var t = document.getElementById('hose1TempDisplay');
+      if (t) t.textContent = fmtTempF(hose1Temp);
+      var s = document.getElementById('hose1StateDisplay');
+      if (s) s.textContent = normalizeHoseState(hose1En, hose1Heat);
+    }
+    if (h2StatusBtn) {
+      if (hose2En && hose2Heat) h2StatusBtn.classList.add('heating'); else h2StatusBtn.classList.remove('heating');
+      var t2 = document.getElementById('hose2TempDisplay');
+      if (t2) t2.textContent = fmtTempF(hose2Temp);
+      var s2 = document.getElementById('hose2StateDisplay');
+      if (s2) s2.textContent = normalizeHoseState(hose2En, hose2Heat);
+    }
+
+    // Setpoint cards
+    var sp1 = document.getElementById('hose1SetValue');
+    var sp2 = document.getElementById('hose2SetValue');
+    if (sp1) sp1.textContent = fmtSetF(hose1Set);
+    if (sp2) sp2.textContent = fmtSetF(hose2Set);
+  }
+
+  function clampHoseSetF(v) {
+    var n = Math.round(Number(v));
+    if (!isFinite(n)) n = 120;
+    // Keep within the same min/max bands we show on gauges
+    if (n < tempMin) n = tempMin;
+    if (n > tempMax) n = tempMax;
+    return n;
+  }
+
+  function adjustHoseSet(which, delta) {
+    var cur = (which === 1) ? hose1Set : hose2Set;
+    if (cur === null || cur === undefined) cur = 120;
+    var next = clampHoseSetF(Number(cur) + Number(delta));
+
+    var payload = (which === 1) ? { hose1Set: next } : { hose2Set: next };
+
+    // Optimistic update so UI feels responsive
+    if (which === 1) hose1Set = next; else hose2Set = next;
+    updateHoseUI();
+
+    return sendControl(payload).then(function(body){
+      if (which === 1 && body.hose1Set !== undefined) hose1Set = body.hose1Set;
+      if (which === 2 && body.hose2Set !== undefined) hose2Set = body.hose2Set;
+      updateHoseUI();
+    }).catch(function(err){
+      setStatus('Hose setpoint error: ' + err.message, true);
+      throw err;
+    });
+  }
+
+  function attachHold(btn, onTapDelta, onHoldDelta, which) {
+    var holdT = null;
+    var holdI = null;
+
+    function clearTimers() {
+      if (holdT) { clearTimeout(holdT); holdT = null; }
+      if (holdI) { clearInterval(holdI); holdI = null; }
+    }
+
+    function start(e) {
+      if (e) e.preventDefault();
+      clearTimers();
+
+      // Immediate single-step
+      adjustHoseSet(which, onTapDelta);
+
+      // After a short hold, begin repeating at 0.75s with 5-degree steps
+      holdT = setTimeout(function(){
+        holdI = setInterval(function(){
+          adjustHoseSet(which, onHoldDelta);
+        }, 750);
+      }, 600);
+    }
+
+    function stop(e) {
+      if (e) e.preventDefault();
+      clearTimers();
+    }
+
+    btn.addEventListener('mousedown', start);
+    btn.addEventListener('touchstart', start, { passive: false });
+
+    btn.addEventListener('mouseup', stop);
+    btn.addEventListener('mouseleave', stop);
+    btn.addEventListener('touchend', stop);
+    btn.addEventListener('touchcancel', stop);
+  }
+
+
+
   function updateGauges(data) {
     var iso      = data.iso      || 0;
     var resin    = data.resin    || 0;
@@ -1765,6 +1908,19 @@ const char* mainPage = R"rawliteral(
     if (data.resinLowTemp !== undefined) resinLowTemp = data.resinLowTemp;
     if (typeof data.drumAir !== 'undefined') drumAir = !!data.drumAir;
     if (typeof data.spray   !== 'undefined') spray   = !!data.spray;
+
+    // Hose heat fields (if present)
+    if (typeof data.hose1En  !== 'undefined') hose1En  = !!data.hose1En;
+    if (typeof data.hose2En  !== 'undefined') hose2En  = !!data.hose2En;
+    if (typeof data.hose1Heat!== 'undefined') hose1Heat= !!data.hose1Heat;
+    if (typeof data.hose2Heat!== 'undefined') hose2Heat= !!data.hose2Heat;
+
+    if (data.hose1Temp !== undefined) hose1Temp = data.hose1Temp;
+    if (data.hose2Temp !== undefined) hose2Temp = data.hose2Temp;
+    if (data.hose1Set  !== undefined) hose1Set  = data.hose1Set;
+    if (data.hose2Set  !== undefined) hose2Set  = data.hose2Set;
+    if (data.hose1Tol  !== undefined) hose1Tol  = data.hose1Tol;
+    if (data.hose2Tol  !== undefined) hose2Tol  = data.hose2Tol;
 
     lastIsoLow   = isoLow;
     lastResinLow = resinLow;
@@ -1833,6 +1989,7 @@ const char* mainPage = R"rawliteral(
 
     updateRatio(iso, resin);
     updateModeButtons();
+    updateHoseUI();
 
     var now = new Date();
     document.getElementById('lastUpdate').textContent =
@@ -1866,6 +2023,17 @@ const char* mainPage = R"rawliteral(
         if (typeof body.drumAir !== 'undefined') drumAir = !!body.drumAir;
         if (typeof body.spray   !== 'undefined') spray   = !!body.spray;
 
+        if (typeof body.hose1En  !== 'undefined') hose1En  = !!body.hose1En;
+        if (typeof body.hose2En  !== 'undefined') hose2En  = !!body.hose2En;
+        if (typeof body.hose1Heat!== 'undefined') hose1Heat= !!body.hose1Heat;
+        if (typeof body.hose2Heat!== 'undefined') hose2Heat= !!body.hose2Heat;
+        if (body.hose1Temp !== undefined) hose1Temp = body.hose1Temp;
+        if (body.hose2Temp !== undefined) hose2Temp = body.hose2Temp;
+        if (body.hose1Set  !== undefined) hose1Set  = body.hose1Set;
+        if (body.hose2Set  !== undefined) hose2Set  = body.hose2Set;
+        if (body.hose1Tol  !== undefined) hose1Tol  = body.hose1Tol;
+        if (body.hose2Tol  !== undefined) hose2Tol  = body.hose2Tol;
+
         if (typeof body.interlock !== 'undefined' && body.interlock) {
           // Interlock still active
           interlockActive = true;
@@ -1876,6 +2044,7 @@ const char* mainPage = R"rawliteral(
         }
 
         updateModeButtons();
+        updateHoseUI();
         return body;
       });
     });
@@ -1906,6 +2075,52 @@ const char* mainPage = R"rawliteral(
   });
 
   
+  // Hose heat enable controls
+  var hose1EnableBtn = document.getElementById('hose1EnableBtn');
+  var hose2EnableBtn = document.getElementById('hose2EnableBtn');
+
+  if (hose1EnableBtn) {
+    hose1EnableBtn.addEventListener('click', function(){
+      var desired = !hose1En;
+      // optimistic
+      hose1En = desired;
+      updateHoseUI();
+
+      sendControl({ hose1En: desired }).then(function(){
+        setStatus(desired ? 'Hose 1 enabled' : 'Hose 1 standby', false);
+      }).catch(function(err){
+        setStatus('Hose 1 enable error: ' + err.message, true);
+      });
+    });
+  }
+
+  if (hose2EnableBtn) {
+    hose2EnableBtn.addEventListener('click', function(){
+      var desired = !hose2En;
+      // optimistic
+      hose2En = desired;
+      updateHoseUI();
+
+      sendControl({ hose2En: desired }).then(function(){
+        setStatus(desired ? 'Hose 2 enabled' : 'Hose 2 standby', false);
+      }).catch(function(err){
+        setStatus('Hose 2 enable error: ' + err.message, true);
+      });
+    });
+  }
+
+  // Hose heat setpoint (press: 1°F, hold: 5°F every 0.75s)
+  var hose1Up = document.getElementById('hose1SetUpBtn');
+  var hose1Dn = document.getElementById('hose1SetDownBtn');
+  var hose2Up = document.getElementById('hose2SetUpBtn');
+  var hose2Dn = document.getElementById('hose2SetDownBtn');
+
+  if (hose1Up) attachHold(hose1Up, +1, +5, 1);
+  if (hose1Dn) attachHold(hose1Dn, -1, -5, 1);
+  if (hose2Up) attachHold(hose2Up, +1, +5, 2);
+  if (hose2Dn) attachHold(hose2Dn, -1, -5, 2);
+
+
   // Shared WebSocket instance with auto-reconnect
   var ws = null;
 
@@ -1950,7 +2165,20 @@ const char* mainPage = R"rawliteral(
   fetch('/api/control').then(function(r){ return r.json(); }).then(function(data){
     if (typeof data.drumAir !== 'undefined') drumAir = !!data.drumAir;
     if (typeof data.spray   !== 'undefined') spray   = !!data.spray;
+
+    if (typeof data.hose1En  !== 'undefined') hose1En  = !!data.hose1En;
+    if (typeof data.hose2En  !== 'undefined') hose2En  = !!data.hose2En;
+    if (typeof data.hose1Heat!== 'undefined') hose1Heat= !!data.hose1Heat;
+    if (typeof data.hose2Heat!== 'undefined') hose2Heat= !!data.hose2Heat;
+    if (data.hose1Temp !== undefined) hose1Temp = data.hose1Temp;
+    if (data.hose2Temp !== undefined) hose2Temp = data.hose2Temp;
+    if (data.hose1Set  !== undefined) hose1Set  = data.hose1Set;
+    if (data.hose2Set  !== undefined) hose2Set  = data.hose2Set;
+    if (data.hose1Tol  !== undefined) hose1Tol  = data.hose1Tol;
+    if (data.hose2Tol  !== undefined) hose2Tol  = data.hose2Tol;
+
     updateModeButtons();
+    updateHoseUI();
   }).catch(function(e){
     console.log('Failed to load relay state:', e);
   });
@@ -2245,6 +2473,22 @@ const char* settingsPage = R"rawliteral(
           <br/>Assign a DS18B20 to the low-side Resin feed.
         </div>
       </div>
+      <div class="field">
+        <label for="hose1TempSensorSelect">Hose 1 Temp Sensor</label>
+        <select id="hose1TempSensorSelect"></select>
+        <div class="hint">
+          Current reading: <span id="hose1TempReading">--</span> °F
+          <br/>Assign a DS18B20 to Hose Heat Section 1.
+        </div>
+      </div>
+      <div class="field">
+        <label for="hose2TempSensorSelect">Hose 2 Temp Sensor</label>
+        <select id="hose2TempSensorSelect"></select>
+        <div class="hint">
+          Current reading: <span id="hose2TempReading">--</span> °F
+          <br/>Assign a DS18B20 to Hose Heat Section 2.
+        </div>
+      </div>
     </fieldset>
 
 
@@ -2340,16 +2584,22 @@ const char* settingsPage = R"rawliteral(
     var resinSel     = document.getElementById('resinTempSensorSelect');
     var isoLowSel    = document.getElementById('isoLowTempSensorSelect');
     var resinLowSel  = document.getElementById('resinLowTempSensorSelect');
+    var hose1Sel     = document.getElementById('hose1TempSensorSelect');
+    var hose2Sel     = document.getElementById('hose2TempSensorSelect');
 
     var isoSpan      = document.getElementById('isoTempReading');
     var resinSpan    = document.getElementById('resinTempReading');
     var isoLowSpan   = document.getElementById('isoLowTempReading');
     var resinLowSpan = document.getElementById('resinLowTempReading');
+    var hose1Span    = document.getElementById('hose1TempReading');
+    var hose2Span    = document.getElementById('hose2TempReading');
 
     var isoId       = isoSel.value;
     var resinId     = resinSel.value;
     var isoLowId    = isoLowSel.value;
     var resinLowId  = resinLowSel.value;
+    var hose1Id     = hose1Sel.value;
+    var hose2Id     = hose2Sel.value;
 
     if (isoId && tempSensorMap.hasOwnProperty(isoId) && tempSensorMap[isoId] != null) {
       isoSpan.textContent = tempSensorMap[isoId].toFixed(1);
@@ -2373,6 +2623,18 @@ const char* settingsPage = R"rawliteral(
       resinLowSpan.textContent = tempSensorMap[resinLowId].toFixed(1);
     } else {
       resinLowSpan.textContent = '--';
+    }
+
+    if (hose1Id && tempSensorMap.hasOwnProperty(hose1Id) && tempSensorMap[hose1Id] != null) {
+      hose1Span.textContent = tempSensorMap[hose1Id].toFixed(1);
+    } else {
+      hose1Span.textContent = '--';
+    }
+
+    if (hose2Id && tempSensorMap.hasOwnProperty(hose2Id) && tempSensorMap[hose2Id] != null) {
+      hose2Span.textContent = tempSensorMap[hose2Id].toFixed(1);
+    } else {
+      hose2Span.textContent = '--';
     }
   }
 
@@ -2440,6 +2702,8 @@ const char* settingsPage = R"rawliteral(
     var resinSel     = document.getElementById('resinTempSensorSelect');
     var isoLowSel    = document.getElementById('isoLowTempSensorSelect');
     var resinLowSel  = document.getElementById('resinLowTempSensorSelect');
+    var hose1Sel     = document.getElementById('hose1TempSensorSelect');
+    var hose2Sel     = document.getElementById('hose2TempSensorSelect');
 
     fetch('/api/temp-sensors')
       .then(function(r){ return r.json(); })
@@ -2459,6 +2723,8 @@ const char* settingsPage = R"rawliteral(
           resinSel.innerHTML    = '';
           isoLowSel.innerHTML   = '';
           resinLowSel.innerHTML = '';
+          hose1Sel.innerHTML    = '';
+          hose2Sel.innerHTML    = '';
 
           var optNone1 = document.createElement('option');
           optNone1.value = '';
@@ -2480,6 +2746,16 @@ const char* settingsPage = R"rawliteral(
           optNone4.textContent = 'Unassigned';
           resinLowSel.appendChild(optNone4);
 
+          var optNone5 = document.createElement('option');
+          optNone5.value = '';
+          optNone5.textContent = 'Unassigned';
+          hose1Sel.appendChild(optNone5);
+
+          var optNone6 = document.createElement('option');
+          optNone6.value = '';
+          optNone6.textContent = 'Unassigned';
+          hose2Sel.appendChild(optNone6);
+
           sensors.forEach(function(s, idx){
             var label = 'Sensor ' + idx + ' (' + s.id + ')';
             if (typeof s.tempF === 'number') {
@@ -2488,7 +2764,7 @@ const char* settingsPage = R"rawliteral(
               label += ' – n/a';
             }
 
-            [isoSel, resinSel, isoLowSel, resinLowSel].forEach(function(sel){
+            [isoSel, resinSel, isoLowSel, resinLowSel, hose1Sel, hose2Sel].forEach(function(sel){
               var opt = document.createElement('option');
               opt.value = s.id;
               opt.textContent = label;
@@ -2508,6 +2784,12 @@ const char* settingsPage = R"rawliteral(
           }
           if (data.resinLow !== undefined && data.resinLow !== null) {
             resinLowSel.value = data.resinLow;
+          }
+          if (data.hose1 !== undefined && data.hose1 !== null) {
+            hose1Sel.value = data.hose1;
+          }
+          if (data.hose2 !== undefined && data.hose2 !== null) {
+            hose2Sel.value = data.hose2;
           }
         }
 
@@ -2530,6 +2812,11 @@ const char* settingsPage = R"rawliteral(
   document.getElementById('resinLowTempSensorSelect')
     .addEventListener('change', updateTempReadouts);
 
+
+  document.getElementById('hose1TempSensorSelect')
+    .addEventListener('change', updateTempReadouts);
+  document.getElementById('hose2TempSensorSelect')
+    .addEventListener('change', updateTempReadouts);
   // Periodically refresh only the temperature values, not the assignments/options
   setInterval(function(){
     refreshTempSensors(false);
@@ -2564,6 +2851,8 @@ const char* settingsPage = R"rawliteral(
     var resinTempId     = document.getElementById('resinTempSensorSelect').value;
     var isoLowTempId    = document.getElementById('isoLowTempSensorSelect').value;
     var resinLowTempId  = document.getElementById('resinLowTempSensorSelect').value;
+    var hose1TempId     = document.getElementById('hose1TempSensorSelect').value;
+    var hose2TempId     = document.getElementById('hose2TempSensorSelect').value;
 
     var settingsPayload = {
       target: target,
@@ -2591,7 +2880,9 @@ const char* settingsPage = R"rawliteral(
       iso:      isoTempId,
       resin:    resinTempId,
       isoLow:   isoLowTempId,
-      resinLow: resinLowTempId
+      resinLow: resinLowTempId,
+      hose1:    hose1TempId,
+      hose2:    hose2TempId
     };
 
     Promise.all([
@@ -2807,6 +3098,23 @@ static inline const char* hoseStatusText(bool enabled, bool heating, float tempF
   return "AT_TEMP";
 }
 
+static inline void fillHoseControlState(JsonDocument& doc)
+{
+  doc["hose1En"] = hose1Enabled;
+  doc["hose2En"] = hose2Enabled;
+  doc["hose1Heat"] = hose1Heating;
+  doc["hose2Heat"] = hose2Heating;
+  doc["hose1Set"] = hose1SetF;
+  doc["hose2Set"] = hose2SetF;
+  doc["hose1Tol"] = hose1TolF;
+  doc["hose2Tol"] = hose2TolF;
+  if (!isnan(hose1TempF)) doc["hose1Temp"] = round1(hose1TempF);
+  if (!isnan(hose2TempF)) doc["hose2Temp"] = round1(hose2TempF);
+  doc["hose1Status"] = hoseStatusText(hose1Enabled, hose1Heating, hose1TempF, hose1SetF, hose1TolF);
+  doc["hose2Status"] = hoseStatusText(hose2Enabled, hose2Heating, hose2TempF, hose2SetF, hose2TolF);
+}
+
+
 // /api/settings
 void handleSettings() {
   if (server.method() == HTTP_GET) {
@@ -2992,54 +3300,7 @@ void handleCalibration() {
     *pR0 = raw0;
     prefs.putFloat((String(sensor) + "_R0").c_str(), *pR0);
     prefs.putFloat((String(sensor) + "_K").c_str(), *pK);
-
-  // Hose heat enable / setpoint / tolerance controls
-  if (doc["hose1En"].is<bool>()) {
-    hose1Enabled = doc["hose1En"];
-    prefs.putBool("hose1En", hose1Enabled);
-    if (!hose1Enabled) {
-      hose1Heating = false;
-      digitalWrite(RELAY_HOSE1_PIN, LOW);
-    }
-  }
-  if (doc["hose2En"].is<bool>()) {
-    hose2Enabled = doc["hose2En"];
-    prefs.putBool("hose2En", hose2Enabled);
-    if (!hose2Enabled) {
-      hose2Heating = false;
-      digitalWrite(RELAY_HOSE2_PIN, LOW);
-    }
-  }
-
-  if (doc["hose1Set"].is<int>()) {
-    hose1SetF = doc["hose1Set"];
-    if (hose1SetF < 40) hose1SetF = 40;
-    if (hose1SetF > 200) hose1SetF = 200;
-    prefs.putInt("hose1SetF", hose1SetF);
-  }
-  if (doc["hose2Set"].is<int>()) {
-    hose2SetF = doc["hose2Set"];
-    if (hose2SetF < 40) hose2SetF = 40;
-    if (hose2SetF > 200) hose2SetF = 200;
-    prefs.putInt("hose2SetF", hose2SetF);
-  }
-  if (doc["hose1Tol"].is<int>()) {
-    hose1TolF = doc["hose1Tol"];
-    if (hose1TolF < 1) hose1TolF = 1;
-    if (hose1TolF > 30) hose1TolF = 30;
-    prefs.putInt("hose1TolF", hose1TolF);
-  }
-  if (doc["hose2Tol"].is<int>()) {
-    hose2TolF = doc["hose2Tol"];
-    if (hose2TolF < 1) hose2TolF = 1;
-    if (hose2TolF > 30) hose2TolF = 30;
-    prefs.putInt("hose2TolF", hose2TolF);
-  }
-
-  // Re-evaluate hose heat immediately after any change
-  applyHoseHeatControl();
-
-  out["ok"]      = true;
+    out["ok"] = true;
     out["raw0"] = raw0;
   } else if (!strcmp(action, "span")) {
     if (!doc["pressure"].is<float>() && !doc["pressure"].is<int>()) {
@@ -3180,9 +3441,6 @@ void handleTempSensors() {
     hose1TempAssigned = parseAddressString(hose1TempAddrStr, hose1TempAddr);
     hose2TempAssigned = parseAddressString(hose2TempAddrStr, hose2TempAddr);
 
-  hose1TempAssigned = parseAddressString(hose1TempAddrStr, hose1TempAddr);
-  hose2TempAssigned = parseAddressString(hose2TempAddrStr, hose2TempAddr);
-
     prefs.putString("isoTempAddr",    isoTempAddrStr);
     prefs.putString("resTempAddr",    resinTempAddrStr);
     prefs.putString("isoLowTempAddr", isoLowTempAddrStr);
@@ -3211,18 +3469,7 @@ void handleControl() {
     JsonDocument doc;
     doc["drumAir"] = drumAirEnabled;
     doc["spray"]   = sprayEnabled;
-    doc["hose1En"] = hose1Enabled;
-    doc["hose2En"] = hose2Enabled;
-    doc["hose1Heat"] = hose1Heating;
-    doc["hose2Heat"] = hose2Heating;
-    doc["hose1Set"] = hose1SetF;
-    doc["hose2Set"] = hose2SetF;
-    doc["hose1Tol"] = hose1TolF;
-    doc["hose2Tol"] = hose2TolF;
-    if (!isnan(hose1TempF)) doc["hose1Temp"] = round1(hose1TempF);
-    if (!isnan(hose2TempF)) doc["hose2Temp"] = round1(hose2TempF);
-    doc["hose1Status"] = hoseStatusText(hose1Enabled, hose1Heating, hose1TempF, hose1SetF, hose1TolF);
-    doc["hose2Status"] = hoseStatusText(hose2Enabled, hose2Heating, hose2TempF, hose2SetF, hose2TolF);
+    fillHoseControlState(doc);
     String s;
     serializeJson(doc, s);
     server.send(200, "application/json", s);
@@ -3246,10 +3493,12 @@ void handleControl() {
     return;
   }
 
+  // --- Drum air ---
   if (doc["drumAir"].is<bool>()) {
     bool desired = doc["drumAir"];
     drumAirEnabled = desired;
     digitalWrite(RELAY_DRUM_AIR_PIN, drumAirEnabled ? HIGH : LOW);
+
     if (!drumAirEnabled) {
       // if you kill drum air, also drop spray as a safety
       sprayEnabled = false;
@@ -3257,30 +3506,21 @@ void handleControl() {
     }
   }
 
+  // --- Spray ---
   if (doc["spray"].is<bool>()) {
     bool desired = doc["spray"];
 
     if (desired) {
       // Guard: only allow spray if both low sides above threshold and drum air is on
       if (!(lastIsoLowPSI >= supplyLowPSI && lastResinLowPSI >= supplyLowPSI)) {
-        // Latch an interlock for low supply
         sprayInterlockActive = true;
         lastInterlockReason  = "Interlock: low supply pressure on feed side.";
 
         out["ok"]        = false;
         out["error"]     = "Low supply pressure";
-        out["drumAir"] = drumAirEnabled;
-  out["spray"]   = sprayEnabled;
-  out["hose1En"] = hose1Enabled;
-  out["hose2En"] = hose2Enabled;
-  out["hose1Heat"] = hose1Heating;
-  out["hose2Heat"] = hose2Heating;
-  out["hose1Set"] = hose1SetF;
-  out["hose2Set"] = hose2SetF;
-  out["hose1Tol"] = hose1TolF;
-  out["hose2Tol"] = hose2TolF;
-  out["hose1Status"] = hoseStatusText(hose1Enabled, hose1Heating, hose1TempF, hose1SetF, hose1TolF);
-  out["hose2Status"] = hoseStatusText(hose2Enabled, hose2Heating, hose2TempF, hose2SetF, hose2TolF);
+        out["drumAir"]   = drumAirEnabled;
+        out["spray"]     = sprayEnabled;
+        fillHoseControlState(out);
         out["interlock"] = lastInterlockReason;
         String s;
         serializeJson(out, s);
@@ -3289,7 +3529,6 @@ void handleControl() {
       }
 
       if (!drumAirEnabled) {
-        // Latch an interlock for missing drum air
         sprayInterlockActive = true;
         lastInterlockReason  = "Interlock: drum air not enabled.";
 
@@ -3297,6 +3536,7 @@ void handleControl() {
         out["error"]     = "Drum air not enabled";
         out["drumAir"]   = drumAirEnabled;
         out["spray"]     = sprayEnabled;
+        fillHoseControlState(out);
         out["interlock"] = lastInterlockReason;
         String s;
         serializeJson(out, s);
@@ -3315,9 +3555,67 @@ void handleControl() {
     }
   }
 
+  // --- Hose heat enable/set/tolerance ---
+  bool hoseChanged = false;
+
+  if (doc["hose1En"].is<bool>()) {
+    hose1Enabled = doc["hose1En"]; 
+    prefs.putBool("hose1En", hose1Enabled);
+    hoseChanged = true;
+  }
+  if (doc["hose2En"].is<bool>()) {
+    hose2Enabled = doc["hose2En"]; 
+    prefs.putBool("hose2En", hose2Enabled);
+    hoseChanged = true;
+  }
+
+  if (doc["hose1Set"].is<int>()) {
+    hose1SetF = doc["hose1Set"]; 
+    if (hose1SetF < 40) hose1SetF = 40;
+    if (hose1SetF > 200) hose1SetF = 200;
+    prefs.putInt("hose1SetF", hose1SetF);
+    hoseChanged = true;
+  }
+  if (doc["hose2Set"].is<int>()) {
+    hose2SetF = doc["hose2Set"]; 
+    if (hose2SetF < 40) hose2SetF = 40;
+    if (hose2SetF > 200) hose2SetF = 200;
+    prefs.putInt("hose2SetF", hose2SetF);
+    hoseChanged = true;
+  }
+
+  if (doc["hose1Tol"].is<int>()) {
+    hose1TolF = doc["hose1Tol"]; 
+    if (hose1TolF < 1) hose1TolF = 1;
+    if (hose1TolF > 30) hose1TolF = 30;
+    prefs.putInt("hose1TolF", hose1TolF);
+    hoseChanged = true;
+  }
+  if (doc["hose2Tol"].is<int>()) {
+    hose2TolF = doc["hose2Tol"]; 
+    if (hose2TolF < 1) hose2TolF = 1;
+    if (hose2TolF > 30) hose2TolF = 30;
+    prefs.putInt("hose2TolF", hose2TolF);
+    hoseChanged = true;
+  }
+
+  if (hoseChanged) {
+    // If disabled, force relay off immediately; otherwise hysteresis will handle it.
+    if (!hose1Enabled) {
+      hose1Heating = false;
+      digitalWrite(RELAY_HOSE1_PIN, LOW);
+    }
+    if (!hose2Enabled) {
+      hose2Heating = false;
+      digitalWrite(RELAY_HOSE2_PIN, LOW);
+    }
+    applyHoseHeatControl();
+  }
+
   out["ok"]      = true;
   out["drumAir"] = drumAirEnabled;
   out["spray"]   = sprayEnabled;
+  fillHoseControlState(out);
   String s;
   serializeJson(out, s);
   server.send(200, "application/json", s);
@@ -3459,6 +3757,10 @@ void setup() {
   resinTempAssigned    = parseAddressString(resinTempAddrStr,    resinTempAddr);
   isoLowTempAssigned   = parseAddressString(isoLowTempAddrStr,   isoLowTempAddr);
   resinLowTempAssigned = parseAddressString(resinLowTempAddrStr, resinLowTempAddr);
+
+  // Hose heat sensor assignments
+  hose1TempAssigned = parseAddressString(hose1TempAddrStr, hose1TempAddr);
+  hose2TempAssigned = parseAddressString(hose2TempAddrStr, hose2TempAddr);
 
   networkMode = prefs.getInt("wifiMode", (int)NETMODE_AP);
   apSsid      = prefs.getString("apSsid",  DEFAULT_AP_SSID);
