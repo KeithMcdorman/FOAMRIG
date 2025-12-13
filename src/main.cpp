@@ -32,7 +32,7 @@
 #include <math.h>
 
 // ---------- Firmware version ----------
-const char* FW_VERSION = "V2.0.1";
+const char* FW_VERSION = "V2.0.0";
 
 // ---------- Sensor pins ----------
 // High-side pressures (0–1600 PSI)
@@ -3007,8 +3007,6 @@ const char* settingsPage = R"rawliteral(
     var hose1TolVal = parseInt(document.getElementById('hose1TolInput').value || '0', 10);
     var hose2TolVal = parseInt(document.getElementById('hose2TolInput').value || '0', 10);
 
-    var hoseOvertempVal = parseInt(document.getElementById('hoseOvertempInput').value || '0', 10);
-
     var wifiModeVal = parseInt(document.getElementById('wifiModeSelect').value || '0', 10);
     var apSsidVal   = document.getElementById('apSsidInput').value || '';
     var apPassVal   = document.getElementById('apPassInput').value || '';
@@ -3921,28 +3919,28 @@ if (doc["hose2En"].is<bool>() || doc["hose2En"].is<int>()) {
 if (doc["hose1Set"].is<int>()) {
   hose1SetF = doc["hose1Set"].as<int>();
   hose1SetF = constrain(hose1SetF, 40, 200);
-  prefs.putInt("hose1Set", hose1SetF);
+  prefs.putInt("hose1SetF", hose1SetF);
   hoseTouched = true;
 }
 
 if (doc["hose2Set"].is<int>()) {
   hose2SetF = doc["hose2Set"].as<int>();
   hose2SetF = constrain(hose2SetF, 40, 200);
-  prefs.putInt("hose2Set", hose2SetF);
+  prefs.putInt("hose2SetF", hose2SetF);
   hoseTouched = true;
 }
 
 if (doc["hose1Tol"].is<int>()) {
   hose1TolF = doc["hose1Tol"].as<int>();
   hose1TolF = constrain(hose1TolF, 0, 20);
-  prefs.putInt("hose1Tol", hose1TolF);
+  prefs.putInt("hose1TolF", hose1TolF);
   hoseTouched = true;
 }
 
 if (doc["hose2Tol"].is<int>()) {
   hose2TolF = doc["hose2Tol"].as<int>();
   hose2TolF = constrain(hose2TolF, 0, 20);
-  prefs.putInt("hose2Tol", hose2TolF);
+  prefs.putInt("hose2TolF", hose2TolF);
   hoseTouched = true;
 }
 
@@ -4127,14 +4125,6 @@ void setup() {
   Serial.println("HMI UART started on GPIO16/17 @115200");
 
 
-  analogReadResolution(12);
-  analogSetPinAttenuation(SENSOR_A_PIN,         ADC_11db);
-  analogSetPinAttenuation(SENSOR_B_PIN,         ADC_11db);
-  analogSetPinAttenuation(SENSOR_AIRPISTON_PIN, ADC_11db);
-  analogSetPinAttenuation(SENSOR_APAIR_PIN,     ADC_11db);
-  analogSetPinAttenuation(SENSOR_ISO_LOW_PIN,    ADC_11db);
-  analogSetPinAttenuation(SENSOR_RESIN_LOW_PIN,  ADC_11db);
-
   // Relay outputs
   pinMode(RELAY_SPRAY_PIN, OUTPUT);
   pinMode(RELAY_DRUM_AIR_PIN, OUTPUT);
@@ -4144,6 +4134,15 @@ void setup() {
   digitalWrite(RELAY_DRUM_AIR_PIN, LOW);
   digitalWrite(RELAY_HOSE1_PIN, LOW);
   digitalWrite(RELAY_HOSE2_PIN, LOW);
+
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(SENSOR_A_PIN,         ADC_11db);
+  analogSetPinAttenuation(SENSOR_B_PIN,         ADC_11db);
+  analogSetPinAttenuation(SENSOR_AIRPISTON_PIN, ADC_11db);
+  analogSetPinAttenuation(SENSOR_APAIR_PIN,     ADC_11db);
+  analogSetPinAttenuation(SENSOR_ISO_LOW_PIN,    ADC_11db);
+  analogSetPinAttenuation(SENSOR_RESIN_LOW_PIN,  ADC_11db);
   // Hose-tip LED (PWM)
   hoseLedInit();
   tempSensors.begin();
@@ -4393,146 +4392,213 @@ void hmiPollUart()
       // Parse JSON commands from the HMI (ArduinoJson)
       char first = hmiRxBuffer[0];
       if (first == '{') {
+        // Newline-delimited JSON control messages from the HMI.
+        // This intentionally mirrors the Live page controls (/api/control), but without exposing Settings.
         JsonDocument cmdDoc;
         DeserializationError jerr = deserializeJson(cmdDoc, hmiRxBuffer);
 
         if (!jerr) {
-          // Option A (legacy): {"cmd":"drum"} / {"cmd":"spray"} = toggle
+          bool hoseTouched = false;
+
+          // ---- Optional request: state snapshot ----
+          // Accept {"cmd":"request_state"} or {"cmd":"state"} (also keeps legacy {"cmd":"..."} behavior below).
           const char* cmd = cmdDoc["cmd"] | "";
-
-          bool handled = false;
-
           if (cmd[0] != '\0') {
+            if (!strcmp(cmd, "request_state") || !strcmp(cmd, "state") || !strcmp(cmd, "live")) {
+              if (lastStatusJson.length()) {
+                HMISerial.write((const uint8_t*)lastStatusJson.c_str(), lastStatusJson.length());
+                HMISerial.write('\n');
+              }
+            }
+
+            // Legacy toggles: {"cmd":"drum"} / {"cmd":"spray"}
             if (!strcmp(cmd, "drum")) {
-              bool desired = !drumAirEnabled;   // toggle
+              bool desired = !drumAirEnabled; // toggle
               drumAirEnabled = desired;
               digitalWrite(RELAY_DRUM_AIR_PIN, drumAirEnabled ? HIGH : LOW);
-
-              Serial.printf("HMI DRUM(cmd) -> drumAir=%d, spray=%d\n",
-                            drumAirEnabled, sprayEnabled);
 
               // If you kill drum air, also drop spray as a safety
               if (!drumAirEnabled) {
                 sprayEnabled = false;
                 digitalWrite(RELAY_SPRAY_PIN, LOW);
               }
-
-              handled = true;
             }
             else if (!strcmp(cmd, "spray")) {
-              bool desired = !sprayEnabled;   // toggle
-
-              if (desired) {
-                // Turning spray ON: apply same interlocks as /api/control
-
-                // Guard: low-side supply must be above threshold
-                if (!(lastIsoLowPSI >= supplyLowPSI &&
-                      lastResinLowPSI >= supplyLowPSI)) {
-                  sprayInterlockActive = true;
-                  lastInterlockReason  = makeLowSupplyInterlockReason(lastIsoHPPSI, lastResinHPPSI,
-                                                                     lastIsoLowPSI, lastResinLowPSI,
-                                                                     supplyLowPSI);
-                  sprayEnabled         = false;
-                  digitalWrite(RELAY_SPRAY_PIN, LOW);
-                  Serial.println("HMI SPRAY(cmd) -> BLOCKED (low supply)");
-                }
-                // Guard: drum air must be enabled
-                else if (!drumAirEnabled) {
-                  sprayInterlockActive = true;
-                  lastInterlockReason  = "Interlock: drum air not enabled.";
-                  sprayEnabled         = false;
-                  digitalWrite(RELAY_SPRAY_PIN, LOW);
-                  Serial.println("HMI SPRAY(cmd) -> BLOCKED (drum air off)");
-                }
-                else {
-                  // Preconditions OK – enable spray and clear interlock
-                  sprayEnabled         = true;
-                  digitalWrite(RELAY_SPRAY_PIN, HIGH);
-                  sprayInterlockActive = false;
-                  lastInterlockReason  = "";
-                  Serial.printf("HMI SPRAY(cmd) -> spray=%d, drumAir=%d\n",
-                                sprayEnabled, drumAirEnabled);
-                }
-              } else {
-                // Turning spray OFF
-                sprayEnabled = false;
-                digitalWrite(RELAY_SPRAY_PIN, LOW);
-                Serial.printf("HMI SPRAY(cmd) -> spray=%d, drumAir=%d\n",
-                              sprayEnabled, drumAirEnabled);
-              }
-
-              handled = true;
+              bool desired = !sprayEnabled; // toggle via legacy command
+              cmdDoc["spray"] = desired;    // normalize to set-style below
             }
           }
 
-          // Option B (preferred going-forward): explicit keys like the web UI
-          // {"drumAir":true} and/or {"spray":true}
-          if (!handled) {
-            if (cmdDoc["drumAir"].is<bool>()) {
-              bool desired = cmdDoc["drumAir"];
-              drumAirEnabled = desired;
-              digitalWrite(RELAY_DRUM_AIR_PIN, drumAirEnabled ? HIGH : LOW);
+          // ---- Set-style controls (preferred) ----
+          // Relays
+          if (cmdDoc["drumAir"].is<bool>() || cmdDoc["drumAir"].is<int>()) {
+            bool desired = (cmdDoc["drumAir"].as<int>() != 0);
+            drumAirEnabled = desired;
+            digitalWrite(RELAY_DRUM_AIR_PIN, drumAirEnabled ? HIGH : LOW);
 
-              if (!drumAirEnabled) {
-                sprayEnabled = false;
-                digitalWrite(RELAY_SPRAY_PIN, LOW);
-              }
-
-              Serial.printf("HMI drumAir -> drumAir=%d, spray=%d\n",
-                            drumAirEnabled, sprayEnabled);
-              handled = true;
-            }
-
-            if (cmdDoc["spray"].is<bool>()) {
-              bool desired = cmdDoc["spray"];
-
-              if (desired) {
-                if (!(lastIsoLowPSI >= supplyLowPSI &&
-                      lastResinLowPSI >= supplyLowPSI)) {
-                  sprayInterlockActive = true;
-                  lastInterlockReason  = makeLowSupplyInterlockReason(lastIsoHPPSI, lastResinHPPSI,
-                                                                     lastIsoLowPSI, lastResinLowPSI,
-                                                                     supplyLowPSI);
-                  sprayEnabled         = false;
-                  digitalWrite(RELAY_SPRAY_PIN, LOW);
-                  Serial.println("HMI spray -> BLOCKED (low supply)");
-                }
-                else if (!drumAirEnabled) {
-                  sprayInterlockActive = true;
-                  lastInterlockReason  = "Interlock: drum air not enabled.";
-                  sprayEnabled         = false;
-                  digitalWrite(RELAY_SPRAY_PIN, LOW);
-                  Serial.println("HMI spray -> BLOCKED (drum air off)");
-                }
-                else {
-                  sprayEnabled         = true;
-                  digitalWrite(RELAY_SPRAY_PIN, HIGH);
-                  sprayInterlockActive = false;
-                  lastInterlockReason  = "";
-                  Serial.printf("HMI spray -> spray=%d, drumAir=%d\n",
-                                sprayEnabled, drumAirEnabled);
-                }
-              } else {
-                sprayEnabled = false;
-                digitalWrite(RELAY_SPRAY_PIN, LOW);
-                Serial.printf("HMI spray -> spray=%d, drumAir=%d\n",
-                              sprayEnabled, drumAirEnabled);
-              }
-
-              handled = true;
+            if (!drumAirEnabled) {
+              sprayEnabled = false;
+              digitalWrite(RELAY_SPRAY_PIN, LOW);
             }
           }
 
-          if (!handled) {
-            Serial.println("HMI JSON parsed, but no recognized cmd/keys.");
+          // Hose enable
+          if (cmdDoc["hose1En"].is<bool>() || cmdDoc["hose1En"].is<int>()) {
+            hose1Enabled = (cmdDoc["hose1En"].as<int>() != 0);
+            prefs.putBool("hose1En", hose1Enabled);
+            if (!hose1Enabled) {
+              hose1Heating = false;
+              digitalWrite(RELAY_HOSE1_PIN, LOW);
+            }
+            hoseTouched = true;
+          }
+
+          if (cmdDoc["hose2En"].is<bool>() || cmdDoc["hose2En"].is<int>()) {
+            hose2Enabled = (cmdDoc["hose2En"].as<int>() != 0);
+            prefs.putBool("hose2En", hose2Enabled);
+            if (!hose2Enabled) {
+              hose2Heating = false;
+              digitalWrite(RELAY_HOSE2_PIN, LOW);
+            }
+            hoseTouched = true;
+          }
+
+          // Hose setpoints / swing ("Tol" on UI behaves as OFF swing above setpoint)
+          if (cmdDoc["hose1Set"].is<int>()) {
+            hose1SetF = constrain(cmdDoc["hose1Set"].as<int>(), 40, 200);
+            prefs.putInt("hose1SetF", hose1SetF);
+            hoseTouched = true;
+          }
+
+          if (cmdDoc["hose2Set"].is<int>()) {
+            hose2SetF = constrain(cmdDoc["hose2Set"].as<int>(), 40, 200);
+            prefs.putInt("hose2SetF", hose2SetF);
+            hoseTouched = true;
+          }
+
+          if (cmdDoc["hose1Tol"].is<int>()) {
+            hose1TolF = constrain(cmdDoc["hose1Tol"].as<int>(), 0, 50);
+            prefs.putInt("hose1TolF", hose1TolF);
+            hoseTouched = true;
+          }
+
+          if (cmdDoc["hose2Tol"].is<int>()) {
+            hose2TolF = constrain(cmdDoc["hose2Tol"].as<int>(), 0, 50);
+            prefs.putInt("hose2TolF", hose2TolF);
+            hoseTouched = true;
+          }
+
+          if (cmdDoc["hoseOvertempF"].is<int>()) {
+            hoseOvertempF = constrain(cmdDoc["hoseOvertempF"].as<int>(), 0, 50);
+            prefs.putInt("hoseOvertempF", hoseOvertempF);
+            hoseTouched = true;
+          }
+
+          if (hoseTouched) {
+            applyHoseHeatControl();
+          }
+
+          // Spray control: same guards as web UI
+          if (cmdDoc["spray"].is<bool>() || cmdDoc["spray"].is<int>()) {
+            bool desired = (cmdDoc["spray"].as<int>() != 0);
+
+            if (desired) {
+              // Block if hose overtemp is active or conditions exceed cutoff
+              if (hoseOvertempActive || !hoseOvertempConditionCleared()) {
+                sprayInterlockActive = true;
+                // Preserve the canonical HOSE OVERTEMP prefix for reset matching
+                if (hose1Enabled && !isnan(hose1TempF) && hose1TempF >= (float)(hose1SetF + hoseOvertempF)) {
+                  lastInterlockReason = String("Interlock: HOSE OVERTEMP - Hose 1 above cutoff.");
+                } else if (hose2Enabled && !isnan(hose2TempF) && hose2TempF >= (float)(hose2SetF + hoseOvertempF)) {
+                  lastInterlockReason = String("Interlock: HOSE OVERTEMP - Hose 2 above cutoff.");
+                } else {
+                  lastInterlockReason = String("Interlock: HOSE OVERTEMP - safety trip active.");
+                }
+
+                sprayEnabled = false;
+                digitalWrite(RELAY_SPRAY_PIN, LOW);
+              }
+              // Low-side supply guard
+              else if (!(lastIsoLowPSI >= supplyLowPSI && lastResinLowPSI >= supplyLowPSI)) {
+                sprayInterlockActive = true;
+                lastInterlockReason  = makeLowSupplyInterlockReason(lastIsoHPPSI, lastResinHPPSI,
+                                                                   lastIsoLowPSI, lastResinLowPSI,
+                                                                   supplyLowPSI);
+                sprayEnabled = false;
+                digitalWrite(RELAY_SPRAY_PIN, LOW);
+              }
+              // Drum air must be enabled to spray
+              else if (!drumAirEnabled) {
+                sprayInterlockActive = true;
+                lastInterlockReason  = String("Interlock: drum air not enabled.");
+                sprayEnabled = false;
+                digitalWrite(RELAY_SPRAY_PIN, LOW);
+              }
+              else {
+                // Preconditions OK – enable spray and clear spray interlock
+                sprayEnabled         = true;
+                digitalWrite(RELAY_SPRAY_PIN, HIGH);
+                sprayInterlockActive = false;
+                if (lastInterlockReason.indexOf("low supply pressure") >= 0 ||
+                    lastInterlockReason.indexOf("drum air not enabled") >= 0 ||
+                    lastInterlockReason.indexOf("HOSE OVERTEMP") >= 0) {
+                  lastInterlockReason = "";
+                }
+              }
+            } else {
+              sprayEnabled = false;
+              digitalWrite(RELAY_SPRAY_PIN, LOW);
+            }
+          }
+
+          // Interlock reset from HMI: {"resetInterlock":true} or {"interlockReset":true}
+          if ((cmdDoc["resetInterlock"].is<bool>() && (bool)cmdDoc["resetInterlock"]) ||
+              (cmdDoc["interlockReset"].is<bool>() && (bool)cmdDoc["interlockReset"]) ||
+              (cmdDoc["resetInterlock"].is<int>() && cmdDoc["resetInterlock"].as<int>() != 0) ||
+              (cmdDoc["interlockReset"].is<int>() && cmdDoc["interlockReset"].as<int>() != 0)) {
+
+            // Mirror the web reset behavior: only clear if triggering condition is cleared.
+            bool canClear = true;
+            String denyReason;
+
+            if (hoseOvertempActive || lastInterlockReason.indexOf("HOSE OVERTEMP") >= 0) {
+              canClear = hoseOvertempConditionCleared();
+              if (!canClear) denyReason = "Hose overtemp condition not cleared.";
+            } else if (lastInterlockReason.indexOf("low supply pressure") >= 0) {
+              canClear = lowSupplyConditionCleared();
+              if (!canClear) denyReason = "Low supply pressure condition not cleared.";
+            } else if (lastInterlockReason.indexOf("drum air not enabled") >= 0) {
+              canClear = drumAirEnabled;
+              if (!canClear) denyReason = "Drum air not enabled.";
+            }
+
+            if (canClear) {
+              sprayInterlockActive = false;
+              hoseOvertempActive   = false;
+              lastInterlockReason  = "";
+
+              sprayEnabled   = false;
+              drumAirEnabled = false;
+              digitalWrite(RELAY_SPRAY_PIN, LOW);
+              digitalWrite(RELAY_DRUM_AIR_PIN, LOW);
+
+              hose1Heating = false;
+              hose2Heating = false;
+              digitalWrite(RELAY_HOSE1_PIN, LOW);
+              digitalWrite(RELAY_HOSE2_PIN, LOW);
+
+              applyHoseHeatControl();
+            } else {
+              // Keep interlock latched; just log deny reason for debugging.
+              Serial.print("HMI reset denied: ");
+              Serial.println(denyReason);
+            }
           }
         } else {
           Serial.print("HMI JSON parse error: ");
           Serial.println(jerr.c_str());
         }
-      }
-
-      // Reset buffer for next line
+      }// Reset buffer for next line
       hmiRxBuffer = "";
     } else {
       // Regular character – append as long as we don't overflow
