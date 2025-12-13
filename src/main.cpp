@@ -32,7 +32,7 @@
 #include <math.h>
 
 // ---------- Firmware version ----------
-const char* FW_VERSION = "V2.0.0";
+const char* FW_VERSION = "V2.0.1";
 
 // ---------- Sensor pins ----------
 // High-side pressures (0–1600 PSI)
@@ -249,6 +249,8 @@ bool sprayEnabled   = false;  // relay on 25
 
 float lastIsoLowPSI   = 0.0f;
 float lastResinLowPSI = 0.0f;
+float lastIsoHPPSI    = 0.0f;
+float lastResinHPPSI  = 0.0f;
 
 // ---------- Hose heat control (2 zones) ----------
 // Backend-only for now: exposes enable/setpoint/tolerance + relay output state
@@ -262,6 +264,8 @@ int hose1SetF = 125;
 int hose2SetF = 125;
 int hose1TolF = 3;
 int hose2TolF = 3;
+int hoseOvertempF = 5;   // °F above setpoint allowed before safety trip
+bool hoseOvertempActive = false;
 
 // Current relay call-for-heat state (latched by hysteresis logic)
 bool hose1Heating = false;
@@ -293,6 +297,26 @@ HoseLedMode hoseLedMode = HOSE_LED_PULSE;
 // ---------- Interlock state ----------
 bool   sprayInterlockActive = false;
 String lastInterlockReason;
+
+// Build a more actionable interlock banner by snapshotting pressures at the moment
+// the interlock is latched (so values don't drift while troubleshooting).
+static inline String fmtPsi1(float v) {
+  if (isnan(v)) return String("NA");
+  return String(v, 1);
+}
+
+static inline String makeLowSupplyInterlockReason(float isoHP, float resinHP,
+                                                  float isoLow, float resinLow,
+                                                  int minPsi)
+{
+  // Keep the canonical phrase "low supply pressure on feed side" so existing
+  // reset-condition checks continue to match.
+  String s = "Interlock: low supply pressure on feed side.";
+  s += " HP Iso " + fmtPsi1(isoHP) + " PSI, Resin " + fmtPsi1(resinHP) + " PSI";
+  s += " | Feed IsoLow " + fmtPsi1(isoLow) + " PSI, ResinLow " + fmtPsi1(resinLow) + " PSI";
+  s += " (min " + String(minPsi) + " PSI).";
+  return s;
+}
 
 // ---------- Helpers for DS18B20 addresses ----------
 
@@ -786,7 +810,25 @@ const char* mainPage = R"rawliteral(
       font-size: 0.9rem;
     }
 
-    .settings-btn:active {
+    
+    .reset-btn {
+      border-radius: 999px;
+      padding: 0.3rem 0.8rem;
+      background: rgba(239, 68, 68, 0.14);
+      border: 1px solid rgba(239, 68, 68, 0.55);
+      color: var(--text-main);
+      font-size: 0.8rem;
+      display: inline-flex;
+      align-items: center;
+      gap: 0.3rem;
+      cursor: pointer;
+      user-select: none;
+    }
+    .reset-btn:hover { filter: brightness(1.08); }
+    .reset-btn:disabled { opacity: 0.55; cursor: not-allowed; }
+
+    .is-hidden { display: none !important; }
+.settings-btn:active {
       transform: translateY(1px);
     }
 
@@ -975,6 +1017,14 @@ const char* mainPage = R"rawliteral(
       color: #020617;
       border-color: rgba(22,163,74,0.9);
       box-shadow: 0 0 10px rgba(22,163,74,0.7);
+    }
+
+    /* Enabled, not actively heating ("At Temp") */
+    .hose-status-btn.attemp {
+      background: linear-gradient(135deg, #0ea5e9, #2563eb);
+      color: #020617;
+      border-color: rgba(37,99,235,0.9);
+      box-shadow: 0 0 10px rgba(37,99,235,0.55);
     }
 
     .hose-label {
@@ -1207,6 +1257,7 @@ const char* mainPage = R"rawliteral(
         <div id="liveDot" class="status-dot"></div>
         <span id="liveStatusText">Connecting…</span>
       </div>
+      <button id="interlockResetBtn" type="button" class="reset-btn is-hidden">Reset</button>
       <a href="/settings" class="settings-btn">
         <span class="icon">⚙️</span>
         <span>Settings</span>
@@ -1320,7 +1371,7 @@ const char* mainPage = R"rawliteral(
 
   <footer>
     <div>Last update: <span id="lastUpdate">--:--:--</span></div>
-    <div class="footer-right">{{FW_VERSION}} • V2: Hose heat backend (2 zones) + JSON telemetry + relay interlock + OTA</div>
+    <div class="footer-right">{{FW_VERSION}} • V2: 2-zone hose heat (setpoint + swing) + JSON telemetry + relay interlock + OTA</div>
   </footer>
 </div>
 
@@ -1368,6 +1419,44 @@ const char* mainPage = R"rawliteral(
   var lastResinLow = 0;
 
   var interlockActive = false;
+  var resetInFlight = false;
+
+  function updateResetButton() {
+    var btn = document.getElementById('interlockResetBtn');
+    if (!btn) return;
+    if (interlockActive) btn.classList.remove('is-hidden');
+    else btn.classList.add('is-hidden');
+    btn.disabled = resetInFlight;
+  }
+
+  function requestInterlockReset() {
+    if (!interlockActive || resetInFlight) return;
+    resetInFlight = true;
+    updateResetButton();
+    fetch('/api/interlock/reset', { method: 'POST' })
+      .then(function(r){ return r.json(); })
+      .then(function(res){
+        if (res && res.ok) {
+          interlockActive = false;
+          setStatus('Ready', false);
+        } else {
+          var msg = (res && (res.error || res.message)) ? (res.error || res.message) : 'Interlock reset denied';
+          setStatus(msg, true);
+          interlockActive = true; // remain latched visually
+        }
+        updateResetButton();
+      })
+      .catch(function(){
+        setStatus('Interlock reset failed', true);
+        interlockActive = true;
+        updateResetButton();
+      })
+      .finally(function(){
+        resetInFlight = false;
+        updateResetButton();
+      });
+  }
+
 
   // Persistent status bar helper
   function setStatus(msg, isError) {
@@ -1384,6 +1473,13 @@ const char* mainPage = R"rawliteral(
 
   // Initial status
   setStatus('Ready', false);
+  // Interlock reset button
+  (function(){
+    var btn = document.getElementById('interlockResetBtn');
+    if (btn) btn.addEventListener('click', requestInterlockReset);
+    updateResetButton();
+  })();
+
 
   // Load settings from device
   fetch('/api/settings').then(function(r){return r.json();}).then(function(data){
@@ -1803,14 +1899,29 @@ const char* mainPage = R"rawliteral(
     var h1StatusBtn = document.getElementById('hose1StatusBtn');
     var h2StatusBtn = document.getElementById('hose2StatusBtn');
     if (h1StatusBtn) {
-      if (hose1En && hose1Heat) h1StatusBtn.classList.add('heating'); else h1StatusBtn.classList.remove('heating');
+      // Green when actively heating, Blue when enabled and not heating ("At Temp")
+      if (hose1En && hose1Heat) {
+        h1StatusBtn.classList.add('heating');
+        h1StatusBtn.classList.remove('attemp');
+      } else {
+        h1StatusBtn.classList.remove('heating');
+        if (hose1En && isFinite(Number(hose1Temp))) h1StatusBtn.classList.add('attemp');
+        else h1StatusBtn.classList.remove('attemp');
+      }
       var t = document.getElementById('hose1TempDisplay');
       if (t) t.textContent = fmtTempF(hose1Temp);
       var s = document.getElementById('hose1StateDisplay');
       if (s) s.textContent = normalizeHoseState(hose1En, hose1Heat);
     }
     if (h2StatusBtn) {
-      if (hose2En && hose2Heat) h2StatusBtn.classList.add('heating'); else h2StatusBtn.classList.remove('heating');
+      if (hose2En && hose2Heat) {
+        h2StatusBtn.classList.add('heating');
+        h2StatusBtn.classList.remove('attemp');
+      } else {
+        h2StatusBtn.classList.remove('heating');
+        if (hose2En && isFinite(Number(hose2Temp))) h2StatusBtn.classList.add('attemp');
+        else h2StatusBtn.classList.remove('attemp');
+      }
       var t2 = document.getElementById('hose2TempDisplay');
       if (t2) t2.textContent = fmtTempF(hose2Temp);
       var s2 = document.getElementById('hose2StateDisplay');
@@ -1936,6 +2047,8 @@ const char* mainPage = R"rawliteral(
         setStatus(bar.textContent || 'Ready', false);
       }
     }
+
+    updateResetButton();
 
     isoGauge.setValue(iso);
     resinGauge.setValue(resin);
@@ -2440,6 +2553,36 @@ const char* settingsPage = R"rawliteral(
     </fieldset>
 
     <fieldset>
+      <legend>Hose Heat</legend>
+      <div class="field">
+        <label for="hose1SetInput">Hose Heat 1 Setpoint (°F)</label>
+        <input type="number" id="hose1SetInput" name="hose1Set" min="-40" max="300" />
+        <div class="hint">Target hose temperature for section 1.</div>
+      </div>
+      <div class="field">
+        <label for="hose1TolInput">Hose Heat 1 Swing (°F)</label>
+        <input type="number" id="hose1TolInput" name="hose1Tol" min="1" max="30" />
+        <div class="hint">Heater turns ON at setpoint and OFF at (setpoint + swing).</div>
+      </div>
+      <div class="field">
+        <label for="hose2SetInput">Hose Heat 2 Setpoint (°F)</label>
+        <input type="number" id="hose2SetInput" name="hose2Set" min="-40" max="300" />
+        <div class="hint">Target hose temperature for section 2.</div>
+      </div>
+      <div class="field">
+        <label for="hose2TolInput">Hose Heat 2 Swing (°F)</label>
+        <input type="number" id="hose2TolInput" name="hose2Tol" min="1" max="30" />
+        <div class="hint">Heater turns ON at setpoint and OFF at (setpoint + swing).</div>
+      </div>
+    
+      <div class="field">
+        <label for="hoseOvertempInput">Hose Overtemp Cutoff (°F)</label>
+        <input type="number" id="hoseOvertempInput" name="hoseOvertempF" min="1" max="50" />
+        <div class="hint">Safety interlock: if a hose temp exceeds (setpoint + cutoff), all hose heaters shut down and the system is parked.</div>
+      </div>
+    </fieldset>
+
+    <fieldset>
       <legend>Temperature Sensors</legend>
       <div class="field">
         <label for="isoTempSensorSelect">Iso HP Temp Sensor</label>
@@ -2677,6 +2820,24 @@ const char* settingsPage = R"rawliteral(
       document.getElementById('tempMaxInput').value = data.tempMaxF;
     }
 
+    // Hose heat controls (setpoint + swing)
+    if (data.hose1Set !== undefined) {
+      document.getElementById('hose1SetInput').value = data.hose1Set;
+    }
+    if (data.hose2Set !== undefined) {
+      document.getElementById('hose2SetInput').value = data.hose2Set;
+    }
+    if (data.hose1Tol !== undefined) {
+      document.getElementById('hose1TolInput').value = data.hose1Tol;
+    }
+    if (data.hose2Tol !== undefined) {
+      document.getElementById('hose2TolInput').value = data.hose2Tol;
+    }
+
+    if (data.hoseOvertempF !== undefined) {
+      document.getElementById('hoseOvertempInput').value = data.hoseOvertempF;
+    }
+
     if (data.wifiMode !== undefined) {
       document.getElementById('wifiModeSelect').value = data.wifiMode;
     }
@@ -2841,6 +3002,13 @@ const char* settingsPage = R"rawliteral(
     var tempMinVal            = parseInt(document.getElementById('tempMinInput').value            || '0', 10);
     var tempMaxVal            = parseInt(document.getElementById('tempMaxInput').value            || '0', 10);
 
+    var hose1SetVal = parseInt(document.getElementById('hose1SetInput').value || '0', 10);
+    var hose2SetVal = parseInt(document.getElementById('hose2SetInput').value || '0', 10);
+    var hose1TolVal = parseInt(document.getElementById('hose1TolInput').value || '0', 10);
+    var hose2TolVal = parseInt(document.getElementById('hose2TolInput').value || '0', 10);
+
+    var hoseOvertempVal = parseInt(document.getElementById('hoseOvertempInput').value || '0', 10);
+
     var wifiModeVal = parseInt(document.getElementById('wifiModeSelect').value || '0', 10);
     var apSsidVal   = document.getElementById('apSsidInput').value || '';
     var apPassVal   = document.getElementById('apPassInput').value || '';
@@ -2869,6 +3037,11 @@ const char* settingsPage = R"rawliteral(
       resinLowTempTarget: resinLowTempTargetVal,
       tempMinF: tempMinVal,
       tempMaxF: tempMaxVal,
+      hose1Set: hose1SetVal,
+      hose2Set: hose2SetVal,
+      hose1Tol: hose1TolVal,
+      hose2Tol: hose2TolVal,
+      hoseOvertempF: hoseOvertempVal,
       wifiMode: wifiModeVal,
       apSsid: apSsidVal,
       apPass: apPassVal,
@@ -3051,12 +3224,13 @@ float applyCalibration(float raw, float R0, float K, float fullScalePsi) {
 }
 
 // ---------- Hose heat control logic ----------
-// Simple hysteresis controller:
-//   ON  when temp < (set - tol)
-//   OFF when temp > (set + tol)
+// "Swing" controller (asymmetric hysteresis):
+//   - Heater turns ON when cooling down to the setpoint (temp <= set)
+//   - Heater turns OFF once it reaches (set + swing)
+// This minimizes cycling and matches slow hose thermal response.
 // Disabled or missing sensor => relay OFF.
 
-static inline void applyHoseHeatZone(bool enabled, float tempF, int setF, int tolF, bool& heating, int relayPin)
+static inline void applyHoseHeatZone(bool enabled, float tempF, int setF, int swingF, bool& heating, int relayPin)
 {
   if (!enabled) {
     heating = false;
@@ -3069,51 +3243,98 @@ static inline void applyHoseHeatZone(bool enabled, float tempF, int setF, int to
     return;
   }
 
-  float low  = (float)setF - (float)tolF;
-  float high = (float)setF + (float)tolF;
+  // ON at setpoint (cooling down):
+  // OFF at set + swing (warming up):
+  const float onAt  = (float)setF;
+  const float offAt = (float)setF + (float)swingF;
 
-  if (!heating && tempF < low) {
+  if (!heating && tempF <= onAt) {
     heating = true;
-  } else if (heating && tempF > high) {
+  } else if (heating && tempF >= offAt) {
     heating = false;
   }
 
   digitalWrite(relayPin, heating ? HIGH : LOW);
 }
 
+
+static inline void tripHoseOvertemp(const char* zoneLabel, float tempF, int setF)
+{
+  if (!hoseOvertempActive) {
+    hoseOvertempActive = true;
+  }
+
+  // Latch an interlock + park system + drop all hose heat outputs
+  sprayInterlockActive = true;
+
+  char buf[196];
+  snprintf(buf, sizeof(buf),
+           "Interlock: HOSE OVERTEMP - %s %.1f°F > %d°F + %d°F. Heaters OFF, system PARKED.",
+           zoneLabel, tempF, setF, hoseOvertempF);
+  lastInterlockReason = String(buf);
+
+  // Park system and cut drum air (conservative safe state)
+  sprayEnabled = false;
+  drumAirEnabled = false;
+  digitalWrite(RELAY_SPRAY_PIN, LOW);
+  digitalWrite(RELAY_DRUM_AIR_PIN, LOW);
+
+  // Drop hose relays immediately
+  hose1Heating = false;
+  hose2Heating = false;
+  digitalWrite(RELAY_HOSE1_PIN, LOW);
+  digitalWrite(RELAY_HOSE2_PIN, LOW);
+
+  // Critical: also DISABLE hose heat so nothing can re-energize unexpectedly.
+  // This is latched (persisted) so a reboot does not automatically restore heat.
+  hose1Enabled = false;
+  hose2Enabled = false;
+  prefs.putBool("hose1En", false);
+  prefs.putBool("hose2En", false);
+}
+
 static inline void applyHoseHeatControl()
 {
+  // Safety: if hose overtemp trip is active, force all hose heat relays OFF.
+  if (hoseOvertempActive) {
+    // Also ensure hose heat is disabled (UI shows OFF/Standby) and can't resume.
+    if (hose1Enabled || hose2Enabled) {
+      hose1Enabled = false;
+      hose2Enabled = false;
+      prefs.putBool("hose1En", false);
+      prefs.putBool("hose2En", false);
+    }
+    hose1Heating = false;
+    hose2Heating = false;
+    digitalWrite(RELAY_HOSE1_PIN, LOW);
+    digitalWrite(RELAY_HOSE2_PIN, LOW);
+    return;
+  }
+
+  // Safety trip: if a hose exceeds (setpoint + hoseOvertempF), park and drop heaters.
+  if (hose1Enabled && !isnan(hose1TempF) && hose1TempF >= (float)(hose1SetF + hoseOvertempF)) {
+    tripHoseOvertemp("Hose 1", hose1TempF, hose1SetF);
+    return;
+  }
+  if (hose2Enabled && !isnan(hose2TempF) && hose2TempF >= (float)(hose2SetF + hoseOvertempF)) {
+    tripHoseOvertemp("Hose 2", hose2TempF, hose2SetF);
+    return;
+  }
+
   applyHoseHeatZone(hose1Enabled, hose1TempF, hose1SetF, hose1TolF, hose1Heating, RELAY_HOSE1_PIN);
   applyHoseHeatZone(hose2Enabled, hose2TempF, hose2SetF, hose2TolF, hose2Heating, RELAY_HOSE2_PIN);
 }
 
-static inline const char* hoseStatusText(bool enabled, bool heating, float tempF, int setF, int tolF)
+static inline const char* hoseStatusText(bool enabled, bool heating, float tempF, int setF, int swingF)
 {
   if (!enabled) return "OFF";
   if (isnan(tempF)) return "NO_SENSOR";
   if (heating) return "HEATING";
-  // not heating, enabled, valid sensor
-  if (fabsf(tempF - (float)setF) <= (float)tolF) return "AT_TEMP";
-  if (tempF > (float)setF + (float)tolF) return "AT_TEMP"; // overshoot is still "at temp" for UI simplification
+  // enabled, valid sensor, not heating
+  (void)setF;
+  (void)swingF;
   return "AT_TEMP";
 }
-
-static inline void fillHoseControlState(JsonDocument& doc)
-{
-  doc["hose1En"] = hose1Enabled;
-  doc["hose2En"] = hose2Enabled;
-  doc["hose1Heat"] = hose1Heating;
-  doc["hose2Heat"] = hose2Heating;
-  doc["hose1Set"] = hose1SetF;
-  doc["hose2Set"] = hose2SetF;
-  doc["hose1Tol"] = hose1TolF;
-  doc["hose2Tol"] = hose2TolF;
-  if (!isnan(hose1TempF)) doc["hose1Temp"] = round1(hose1TempF);
-  if (!isnan(hose2TempF)) doc["hose2Temp"] = round1(hose2TempF);
-  doc["hose1Status"] = hoseStatusText(hose1Enabled, hose1Heating, hose1TempF, hose1SetF, hose1TolF);
-  doc["hose2Status"] = hoseStatusText(hose2Enabled, hose2Heating, hose2TempF, hose2SetF, hose2TolF);
-}
-
 
 // /api/settings
 void handleSettings() {
@@ -3142,6 +3363,8 @@ void handleSettings() {
     doc["hose2Set"] = hose2SetF;
     doc["hose1Tol"] = hose1TolF;
     doc["hose2Tol"] = hose2TolF;
+    doc["hoseOvertempF"] = hoseOvertempF;
+    doc["hoseOvertemp"] = hoseOvertempActive;
 
     doc["wifiMode"] = networkMode;
     doc["apSsid"]   = apSsid;
@@ -3183,6 +3406,8 @@ void handleSettings() {
     if (doc["hose1En"].is<bool>()) hose1Enabled = doc["hose1En"];
     if (doc["hose2En"].is<bool>()) hose2Enabled = doc["hose2En"];
 
+    if (doc["hoseOvertempF"].is<int>()) hoseOvertempF = doc["hoseOvertempF"];
+
     // Clamp sane ranges
     if (hose1SetF < 40) hose1SetF = 40;
     if (hose2SetF < 40) hose2SetF = 40;
@@ -3192,6 +3417,9 @@ void handleSettings() {
     if (hose2TolF < 1) hose2TolF = 1;
     if (hose1TolF > 30) hose1TolF = 30;
     if (hose2TolF > 30) hose2TolF = 30;
+
+    if (hoseOvertempF < 1) hoseOvertempF = 1;
+    if (hoseOvertempF > 50) hoseOvertempF = 50;
 
     if (doc["wifiMode"].is<int>()) {
       networkMode = (int)doc["wifiMode"];
@@ -3239,6 +3467,7 @@ void handleSettings() {
     prefs.putInt("hose2SetF", hose2SetF);
     prefs.putInt("hose1TolF", hose1TolF);
     prefs.putInt("hose2TolF", hose2TolF);
+    prefs.putInt("hoseOvertempF", hoseOvertempF);
 
     prefs.putInt("wifiMode", networkMode);
     prefs.putString("apSsid",  apSsid);
@@ -3300,7 +3529,61 @@ void handleCalibration() {
     *pR0 = raw0;
     prefs.putFloat((String(sensor) + "_R0").c_str(), *pR0);
     prefs.putFloat((String(sensor) + "_K").c_str(), *pK);
-    out["ok"] = true;
+
+  // Hose heat enable / setpoint / tolerance controls
+  if (doc["hose1En"].is<bool>()) {
+    hose1Enabled = doc["hose1En"];
+    prefs.putBool("hose1En", hose1Enabled);
+    if (!hose1Enabled) {
+      hose1Heating = false;
+      digitalWrite(RELAY_HOSE1_PIN, LOW);
+    }
+  }
+  if (doc["hose2En"].is<bool>()) {
+    hose2Enabled = doc["hose2En"];
+    prefs.putBool("hose2En", hose2Enabled);
+    if (!hose2Enabled) {
+      hose2Heating = false;
+      digitalWrite(RELAY_HOSE2_PIN, LOW);
+    }
+  }
+
+  if (doc["hose1Set"].is<int>()) {
+    hose1SetF = doc["hose1Set"];
+    if (hose1SetF < 40) hose1SetF = 40;
+    if (hose1SetF > 200) hose1SetF = 200;
+    prefs.putInt("hose1SetF", hose1SetF);
+  }
+  if (doc["hose2Set"].is<int>()) {
+    hose2SetF = doc["hose2Set"];
+    if (hose2SetF < 40) hose2SetF = 40;
+    if (hose2SetF > 200) hose2SetF = 200;
+    prefs.putInt("hose2SetF", hose2SetF);
+  }
+  if (doc["hose1Tol"].is<int>()) {
+    hose1TolF = doc["hose1Tol"];
+    if (hose1TolF < 1) hose1TolF = 1;
+    if (hose1TolF > 30) hose1TolF = 30;
+    prefs.putInt("hose1TolF", hose1TolF);
+  }
+  if (doc["hose2Tol"].is<int>()) {
+    hose2TolF = doc["hose2Tol"];
+    if (hose2TolF < 1) hose2TolF = 1;
+    if (hose2TolF > 30) hose2TolF = 30;
+    prefs.putInt("hose2TolF", hose2TolF);
+
+    if (doc["hoseOvertempF"].is<int>()) {
+      hoseOvertempF = doc["hoseOvertempF"];
+      if (hoseOvertempF < 1) hoseOvertempF = 1;
+      if (hoseOvertempF > 50) hoseOvertempF = 50;
+      prefs.putInt("hoseOvertempF", hoseOvertempF);
+    }
+  }
+
+  // Re-evaluate hose heat immediately after any change
+  applyHoseHeatControl();
+
+  out["ok"]      = true;
     out["raw0"] = raw0;
   } else if (!strcmp(action, "span")) {
     if (!doc["pressure"].is<float>() && !doc["pressure"].is<int>()) {
@@ -3441,6 +3724,9 @@ void handleTempSensors() {
     hose1TempAssigned = parseAddressString(hose1TempAddrStr, hose1TempAddr);
     hose2TempAssigned = parseAddressString(hose2TempAddrStr, hose2TempAddr);
 
+  hose1TempAssigned = parseAddressString(hose1TempAddrStr, hose1TempAddr);
+  hose2TempAssigned = parseAddressString(hose2TempAddrStr, hose2TempAddr);
+
     prefs.putString("isoTempAddr",    isoTempAddrStr);
     prefs.putString("resTempAddr",    resinTempAddrStr);
     prefs.putString("isoLowTempAddr", isoLowTempAddrStr);
@@ -3469,7 +3755,22 @@ void handleControl() {
     JsonDocument doc;
     doc["drumAir"] = drumAirEnabled;
     doc["spray"]   = sprayEnabled;
-    fillHoseControlState(doc);
+    doc["hose1En"] = hose1Enabled;
+    doc["hose2En"] = hose2Enabled;
+    doc["hose1Heat"] = hose1Heating;
+    doc["hose2Heat"] = hose2Heating;
+    doc["hose1Set"] = hose1SetF;
+    doc["hose2Set"] = hose2SetF;
+    doc["hose1Tol"] = hose1TolF;
+    doc["hose2Tol"] = hose2TolF;
+    doc["hoseOvertempF"] = hoseOvertempF;
+    doc["hoseOvertemp"] = hoseOvertempActive;
+    doc["hoseOvertempF"] = hoseOvertempF;
+    doc["hoseOvertemp"] = hoseOvertempActive;
+    if (!isnan(hose1TempF)) doc["hose1Temp"] = round1(hose1TempF);
+    if (!isnan(hose2TempF)) doc["hose2Temp"] = round1(hose2TempF);
+    doc["hose1Status"] = hoseStatusText(hose1Enabled, hose1Heating, hose1TempF, hose1SetF, hose1TolF);
+    doc["hose2Status"] = hoseStatusText(hose2Enabled, hose2Heating, hose2TempF, hose2SetF, hose2TolF);
     String s;
     serializeJson(doc, s);
     server.send(200, "application/json", s);
@@ -3493,12 +3794,10 @@ void handleControl() {
     return;
   }
 
-  // --- Drum air ---
   if (doc["drumAir"].is<bool>()) {
     bool desired = doc["drumAir"];
     drumAirEnabled = desired;
     digitalWrite(RELAY_DRUM_AIR_PIN, drumAirEnabled ? HIGH : LOW);
-
     if (!drumAirEnabled) {
       // if you kill drum air, also drop spray as a safety
       sprayEnabled = false;
@@ -3506,21 +3805,57 @@ void handleControl() {
     }
   }
 
-  // --- Spray ---
   if (doc["spray"].is<bool>()) {
     bool desired = doc["spray"];
 
     if (desired) {
+      // Guard: block Spray if hose overtemp safety is active or hoses are above cutoff
+      if (hoseOvertempActive ||
+          (hose1Enabled && !isnan(hose1TempF) && hose1TempF >= (float)(hose1SetF + hoseOvertempF)) ||
+          (hose2Enabled && !isnan(hose2TempF) && hose2TempF >= (float)(hose2SetF + hoseOvertempF))) {
+        sprayInterlockActive = true;
+        if (!hoseOvertempActive) {
+          // set reason even if we haven't latched yet
+          if (hose1Enabled && !isnan(hose1TempF) && hose1TempF >= (float)(hose1SetF + hoseOvertempF)) {
+            lastInterlockReason = String("Interlock: HOSE OVERTEMP - Hose 1 above cutoff.");
+          } else if (hose2Enabled && !isnan(hose2TempF) && hose2TempF >= (float)(hose2SetF + hoseOvertempF)) {
+            lastInterlockReason = String("Interlock: HOSE OVERTEMP - Hose 2 above cutoff.");
+          } else {
+            lastInterlockReason = String("Interlock: HOSE OVERTEMP - safety trip active.");
+          }
+        }
+
+        out["ok"] = false;
+        out["error"] = "Hose overtemp safety";
+        out["interlock"] = lastInterlockReason;
+        String s;
+        serializeJson(out, s);
+        server.send(400, "application/json", s);
+        return;
+      }
+
       // Guard: only allow spray if both low sides above threshold and drum air is on
       if (!(lastIsoLowPSI >= supplyLowPSI && lastResinLowPSI >= supplyLowPSI)) {
+        // Latch an interlock for low supply
         sprayInterlockActive = true;
-        lastInterlockReason  = "Interlock: low supply pressure on feed side.";
+        lastInterlockReason  = makeLowSupplyInterlockReason(lastIsoHPPSI, lastResinHPPSI,
+                                                           lastIsoLowPSI, lastResinLowPSI,
+                                                           supplyLowPSI);
 
         out["ok"]        = false;
         out["error"]     = "Low supply pressure";
-        out["drumAir"]   = drumAirEnabled;
-        out["spray"]     = sprayEnabled;
-        fillHoseControlState(out);
+        out["drumAir"] = drumAirEnabled;
+  out["spray"]   = sprayEnabled;
+  out["hose1En"] = hose1Enabled;
+  out["hose2En"] = hose2Enabled;
+  out["hose1Heat"] = hose1Heating;
+  out["hose2Heat"] = hose2Heating;
+  out["hose1Set"] = hose1SetF;
+  out["hose2Set"] = hose2SetF;
+  out["hose1Tol"] = hose1TolF;
+  out["hose2Tol"] = hose2TolF;
+  out["hose1Status"] = hoseStatusText(hose1Enabled, hose1Heating, hose1TempF, hose1SetF, hose1TolF);
+  out["hose2Status"] = hoseStatusText(hose2Enabled, hose2Heating, hose2TempF, hose2SetF, hose2TolF);
         out["interlock"] = lastInterlockReason;
         String s;
         serializeJson(out, s);
@@ -3529,6 +3864,7 @@ void handleControl() {
       }
 
       if (!drumAirEnabled) {
+        // Latch an interlock for missing drum air
         sprayInterlockActive = true;
         lastInterlockReason  = "Interlock: drum air not enabled.";
 
@@ -3536,7 +3872,6 @@ void handleControl() {
         out["error"]     = "Drum air not enabled";
         out["drumAir"]   = drumAirEnabled;
         out["spray"]     = sprayEnabled;
-        fillHoseControlState(out);
         out["interlock"] = lastInterlockReason;
         String s;
         serializeJson(out, s);
@@ -3555,71 +3890,178 @@ void handleControl() {
     }
   }
 
-  // --- Hose heat enable/set/tolerance ---
-  bool hoseChanged = false;
+  
 
-  if (doc["hose1En"].is<bool>()) {
-    hose1Enabled = doc["hose1En"]; 
-    prefs.putBool("hose1En", hose1Enabled);
-    hoseChanged = true;
-  }
-  if (doc["hose2En"].is<bool>()) {
-    hose2Enabled = doc["hose2En"]; 
-    prefs.putBool("hose2En", hose2Enabled);
-    hoseChanged = true;
-  }
+// Hose heat enable / setpoint / swing controls (live page)
+// Note: "Tol" on the UI is implemented as an OFF swing above setpoint:
+//   ON  at temp <= setpoint
+//   OFF at temp >= setpoint + swing
+bool hoseTouched = false;
 
-  if (doc["hose1Set"].is<int>()) {
-    hose1SetF = doc["hose1Set"]; 
-    if (hose1SetF < 40) hose1SetF = 40;
-    if (hose1SetF > 200) hose1SetF = 200;
-    prefs.putInt("hose1SetF", hose1SetF);
-    hoseChanged = true;
+if (doc["hose1En"].is<bool>() || doc["hose1En"].is<int>()) {
+  hose1Enabled = (doc["hose1En"].as<int>() != 0);
+  prefs.putBool("hose1En", hose1Enabled);
+  if (!hose1Enabled) {
+    hose1Heating = false;
+    digitalWrite(RELAY_HOSE1_PIN, LOW);
   }
-  if (doc["hose2Set"].is<int>()) {
-    hose2SetF = doc["hose2Set"]; 
-    if (hose2SetF < 40) hose2SetF = 40;
-    if (hose2SetF > 200) hose2SetF = 200;
-    prefs.putInt("hose2SetF", hose2SetF);
-    hoseChanged = true;
-  }
+  hoseTouched = true;
+}
 
-  if (doc["hose1Tol"].is<int>()) {
-    hose1TolF = doc["hose1Tol"]; 
-    if (hose1TolF < 1) hose1TolF = 1;
-    if (hose1TolF > 30) hose1TolF = 30;
-    prefs.putInt("hose1TolF", hose1TolF);
-    hoseChanged = true;
+if (doc["hose2En"].is<bool>() || doc["hose2En"].is<int>()) {
+  hose2Enabled = (doc["hose2En"].as<int>() != 0);
+  prefs.putBool("hose2En", hose2Enabled);
+  if (!hose2Enabled) {
+    hose2Heating = false;
+    digitalWrite(RELAY_HOSE2_PIN, LOW);
   }
-  if (doc["hose2Tol"].is<int>()) {
-    hose2TolF = doc["hose2Tol"]; 
-    if (hose2TolF < 1) hose2TolF = 1;
-    if (hose2TolF > 30) hose2TolF = 30;
-    prefs.putInt("hose2TolF", hose2TolF);
-    hoseChanged = true;
-  }
+  hoseTouched = true;
+}
 
-  if (hoseChanged) {
-    // If disabled, force relay off immediately; otherwise hysteresis will handle it.
-    if (!hose1Enabled) {
-      hose1Heating = false;
-      digitalWrite(RELAY_HOSE1_PIN, LOW);
-    }
-    if (!hose2Enabled) {
-      hose2Heating = false;
-      digitalWrite(RELAY_HOSE2_PIN, LOW);
-    }
-    applyHoseHeatControl();
-  }
+if (doc["hose1Set"].is<int>()) {
+  hose1SetF = doc["hose1Set"].as<int>();
+  hose1SetF = constrain(hose1SetF, 40, 200);
+  prefs.putInt("hose1Set", hose1SetF);
+  hoseTouched = true;
+}
 
-  out["ok"]      = true;
-  out["drumAir"] = drumAirEnabled;
-  out["spray"]   = sprayEnabled;
-  fillHoseControlState(out);
-  String s;
+if (doc["hose2Set"].is<int>()) {
+  hose2SetF = doc["hose2Set"].as<int>();
+  hose2SetF = constrain(hose2SetF, 40, 200);
+  prefs.putInt("hose2Set", hose2SetF);
+  hoseTouched = true;
+}
+
+if (doc["hose1Tol"].is<int>()) {
+  hose1TolF = doc["hose1Tol"].as<int>();
+  hose1TolF = constrain(hose1TolF, 0, 20);
+  prefs.putInt("hose1Tol", hose1TolF);
+  hoseTouched = true;
+}
+
+if (doc["hose2Tol"].is<int>()) {
+  hose2TolF = doc["hose2Tol"].as<int>();
+  hose2TolF = constrain(hose2TolF, 0, 20);
+  prefs.putInt("hose2Tol", hose2TolF);
+  hoseTouched = true;
+}
+
+if (hoseTouched) {
+  // Apply immediately so the UI doesn't appear to "flash" back on the next WS update
+  applyHoseHeatControl();
+}
+out["ok"]      = true;
+out["drumAir"] = drumAirEnabled;
+out["spray"]   = sprayEnabled;
+
+// Echo full hose heat state so the web UI can update immediately
+out["hose1En"]   = hose1Enabled;
+out["hose2En"]   = hose2Enabled;
+out["hose1Heat"] = hose1Heating;
+out["hose2Heat"] = hose2Heating;
+out["hose1Set"]  = hose1SetF;
+out["hose2Set"]  = hose2SetF;
+out["hose1Tol"]  = hose1TolF;
+out["hose2Tol"]  = hose2TolF;
+if (!isnan(hose1TempF)) out["hose1Temp"] = round1(hose1TempF);
+if (!isnan(hose2TempF)) out["hose2Temp"] = round1(hose2TempF);
+out["hose1Status"] = hoseStatusText(hose1Enabled, hose1Heating, hose1TempF, hose1SetF, hose1TolF);
+out["hose2Status"] = hoseStatusText(hose2Enabled, hose2Heating, hose2TempF, hose2SetF, hose2TolF);
+String s;
   serializeJson(out, s);
   server.send(200, "application/json", s);
 }
+
+// ---------- Interlock reset (web UI) ----------
+static bool hoseOvertempConditionCleared()
+{
+  // Require at least one assigned hose sensor to evaluate.
+  bool anyAssigned = false;
+
+  if (hose1TempAssigned) {
+    anyAssigned = true;
+    if (isnan(hose1TempF)) return false;
+    if (hose1TempF > (float)(hose1SetF + hoseOvertempF)) return false;
+  }
+  if (hose2TempAssigned) {
+    anyAssigned = true;
+    if (isnan(hose2TempF)) return false;
+    if (hose2TempF > (float)(hose2SetF + hoseOvertempF)) return false;
+  }
+
+  return anyAssigned;
+}
+
+static bool lowSupplyConditionCleared()
+{
+  return (lastIsoLowPSI >= supplyLowPSI) && (lastResinLowPSI >= supplyLowPSI);
+}
+
+static void handleInterlockReset()
+{
+  JsonDocument out;
+
+  const bool anyInterlock = sprayInterlockActive || hoseOvertempActive;
+  if (!anyInterlock) {
+    out["ok"] = true;
+    out["message"] = "No active interlock.";
+    out["interlock"] = "";
+    String s; serializeJson(out, s);
+    server.send(200, "application/json", s);
+    return;
+  }
+
+  bool canClear = true;
+  String denyReason;
+
+  // For hose overtemp, require temps back under threshold.
+  if (hoseOvertempActive || lastInterlockReason.indexOf("HOSE OVERTEMP") >= 0) {
+    canClear = hoseOvertempConditionCleared();
+    if (!canClear) denyReason = "Hose overtemp condition not cleared.";
+  }
+  // For low supply interlock, require both low-side feeds above threshold.
+  else if (lastInterlockReason.indexOf("low supply pressure") >= 0) {
+    canClear = lowSupplyConditionCleared();
+    if (!canClear) denyReason = "Low supply pressure condition not cleared.";
+  }
+  // For drum air interlock, require drum air enabled.
+  else if (lastInterlockReason.indexOf("drum air not enabled") >= 0) {
+    canClear = drumAirEnabled;
+    if (!canClear) denyReason = "Drum air not enabled.";
+  }
+
+  if (!canClear) {
+    out["ok"] = false;
+    out["error"] = denyReason;
+    out["interlock"] = lastInterlockReason;
+    String s; serializeJson(out, s);
+    server.send(409, "application/json", s);
+    return;
+  }
+
+  // Clear interlocks and put system into a safe READY state (parked, outputs off).
+  sprayInterlockActive = false;
+  hoseOvertempActive   = false;
+  lastInterlockReason  = "";
+
+  sprayEnabled   = false;
+  drumAirEnabled = false;
+  digitalWrite(RELAY_SPRAY_PIN, LOW);
+  digitalWrite(RELAY_DRUM_AIR_PIN, LOW);
+
+  hose1Heating = false;
+  hose2Heating = false;
+  digitalWrite(RELAY_HOSE1_PIN, LOW);
+  digitalWrite(RELAY_HOSE2_PIN, LOW);
+
+  out["ok"] = true;
+  out["message"] = "Interlock cleared. System READY (parked).";
+  out["interlock"] = "";
+  String s; serializeJson(out, s);
+  server.send(200, "application/json", s);
+}
+
+
 
 // OTA upload handler
 void handleUpdateUpload() {
@@ -3730,6 +4172,18 @@ void setup() {
   hose2SetF    = prefs.getInt("hose2SetF", 125);
   hose1TolF    = prefs.getInt("hose1TolF", 3);
   hose2TolF    = prefs.getInt("hose2TolF", 3);
+  hoseOvertempF = prefs.getInt("hoseOvertempF", 5);
+  if (hoseOvertempF < 1) hoseOvertempF = 1;
+  if (hoseOvertempF > 50) hoseOvertempF = 50;
+
+  // Safety: never energize hose heaters automatically on boot.
+  // After any reboot/power-cycle, the user must explicitly re-enable hose heat.
+  if (hose1Enabled || hose2Enabled) {
+    hose1Enabled = false;
+    hose2Enabled = false;
+    prefs.putBool("hose1En", false);
+    prefs.putBool("hose2En", false);
+  }
 
 
   isoR0   = prefs.getFloat("iso_R0",   0.0f);
@@ -3758,9 +4212,9 @@ void setup() {
   isoLowTempAssigned   = parseAddressString(isoLowTempAddrStr,   isoLowTempAddr);
   resinLowTempAssigned = parseAddressString(resinLowTempAddrStr, resinLowTempAddr);
 
-  // Hose heat sensor assignments
-  hose1TempAssigned = parseAddressString(hose1TempAddrStr, hose1TempAddr);
-  hose2TempAssigned = parseAddressString(hose2TempAddrStr, hose2TempAddr);
+  // Hose heat temp sensor assignments (must be parsed at boot so live temps render)
+  hose1TempAssigned    = parseAddressString(hose1TempAddrStr, hose1TempAddr);
+  hose2TempAssigned    = parseAddressString(hose2TempAddrStr, hose2TempAddr);
 
   networkMode = prefs.getInt("wifiMode", (int)NETMODE_AP);
   apSsid      = prefs.getString("apSsid",  DEFAULT_AP_SSID);
@@ -3785,6 +4239,7 @@ void setup() {
   server.on("/calibration/status", HTTP_GET, handleCalibrationStatus);
   server.on("/api/temp-sensors", handleTempSensors);
   server.on("/api/control", handleControl);
+  server.on("/api/interlock/reset", HTTP_POST, handleInterlockReset);
   server.on("/api/live", HTTP_GET, handleLiveStatus);
 
   // OTA endpoints
@@ -3974,7 +4429,9 @@ void hmiPollUart()
                 if (!(lastIsoLowPSI >= supplyLowPSI &&
                       lastResinLowPSI >= supplyLowPSI)) {
                   sprayInterlockActive = true;
-                  lastInterlockReason  = "Interlock: low supply pressure on feed side.";
+                  lastInterlockReason  = makeLowSupplyInterlockReason(lastIsoHPPSI, lastResinHPPSI,
+                                                                     lastIsoLowPSI, lastResinLowPSI,
+                                                                     supplyLowPSI);
                   sprayEnabled         = false;
                   digitalWrite(RELAY_SPRAY_PIN, LOW);
                   Serial.println("HMI SPRAY(cmd) -> BLOCKED (low supply)");
@@ -4033,7 +4490,9 @@ void hmiPollUart()
                 if (!(lastIsoLowPSI >= supplyLowPSI &&
                       lastResinLowPSI >= supplyLowPSI)) {
                   sprayInterlockActive = true;
-                  lastInterlockReason  = "Interlock: low supply pressure on feed side.";
+                  lastInterlockReason  = makeLowSupplyInterlockReason(lastIsoHPPSI, lastResinHPPSI,
+                                                                     lastIsoLowPSI, lastResinLowPSI,
+                                                                     supplyLowPSI);
                   sprayEnabled         = false;
                   digitalWrite(RELAY_SPRAY_PIN, LOW);
                   Serial.println("HMI spray -> BLOCKED (low supply)");
@@ -4116,6 +4575,9 @@ void loop() {
     float airPistonPSI = applyCalibration(rawAir,      airR0,      airK,       300.0f);
     float apAirPSI     = applyCalibration(rawApAir,    apAirR0,    apAirK,     300.0f);
 
+    // Cache latest readings for UI banners / interlock snapshot text.
+    lastIsoHPPSI   = isoPSI;
+    lastResinHPPSI = resinPSI;
     lastIsoLowPSI   = isoLowPSI;
     lastResinLowPSI = resinLowPSI;
 
@@ -4128,7 +4590,9 @@ void loop() {
       digitalWrite(RELAY_SPRAY_PIN, LOW);
       digitalWrite(RELAY_DRUM_AIR_PIN, LOW);
       sprayInterlockActive = true;
-      lastInterlockReason  = "Interlock: low supply pressure on feed side.";
+      lastInterlockReason  = makeLowSupplyInterlockReason(isoPSI, resinPSI,
+                                                         isoLowPSI, resinLowPSI,
+                                                         supplyLowPSI);
     }
 
     // --- Hose-tip LED mode based on Iso HP vs green band ---
@@ -4186,6 +4650,8 @@ void loop() {
     doc["hose2Set"]  = hose2SetF;
     doc["hose1Tol"]  = hose1TolF;
     doc["hose2Tol"]  = hose2TolF;
+    doc["hoseOvertempF"] = hoseOvertempF;
+    doc["hoseOvertemp"]  = hoseOvertempActive ? 1 : 0;
     if (!isnan(hose1TempF)) doc["hose1Temp"] = round1(hose1TempF);
     if (!isnan(hose2TempF)) doc["hose2Temp"] = round1(hose2TempF);
     doc["hose1Status"] = hoseStatusText(hose1Enabled, hose1Heating, hose1TempF, hose1SetF, hose1TolF);
