@@ -3006,6 +3006,7 @@ const char* settingsPage = R"rawliteral(
     var hose2SetVal = parseInt(document.getElementById('hose2SetInput').value || '0', 10);
     var hose1TolVal = parseInt(document.getElementById('hose1TolInput').value || '0', 10);
     var hose2TolVal = parseInt(document.getElementById('hose2TolInput').value || '0', 10);
+    var hoseOvertempVal = parseInt(document.getElementById('hoseOvertempInput').value || '0', 10);
 
     var wifiModeVal = parseInt(document.getElementById('wifiModeSelect').value || '0', 10);
     var apSsidVal   = document.getElementById('apSsidInput').value || '';
