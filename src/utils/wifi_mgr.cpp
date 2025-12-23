@@ -6,7 +6,7 @@
 
 void setupWiFi() {
   WiFi.persistent(false);
-  WiFi.disconnect(true, true);
+  WiFi.disconnect(true, false);
   delay(200);
 
   // Reset fallback tracking on fresh WiFi setup
