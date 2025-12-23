@@ -100,7 +100,7 @@ const char* FW_VERSION = "V2.0.0";
   #define ESP_ARDUINO_VERSION_MAJOR 2
 #endif
 
-#if ESP_ARDUINO_VERSION_MAJOR >= 3
+#if defined(ESP_ARDUINO_VERSION_MAJOR) && (ESP_ARDUINO_VERSION_MAJOR >= 3)
 static inline void hoseLedInit() {
   // New API: ledcAttach(pin, freq, resolution_bits)
   ledcAttach(HOSE_LED_PIN, HOSE_LED_LEDC_FREQ, HOSE_LED_LEDC_BITS);
@@ -110,14 +110,14 @@ static inline void hoseLedWrite(uint32_t duty) {
   ledcWrite(HOSE_LED_PIN, duty);
 }
 #else
+// Legacy API: ledcSetup(channel, freq, resolution_bits) + ledcAttachPin(pin, channel)
+static inline void hoseLedWrite(uint32_t duty) {
+  ledcWrite(HOSE_LED_LEDC_CH, duty);
+}
 static inline void hoseLedInit() {
-  // Legacy API: ledcSetup(channel, freq, resolution_bits) + ledcAttachPin(pin, channel)
   ledcSetup(HOSE_LED_LEDC_CH, HOSE_LED_LEDC_FREQ, HOSE_LED_LEDC_BITS);
   ledcAttachPin(HOSE_LED_PIN, HOSE_LED_LEDC_CH);
   hoseLedWrite(0);
-}
-static inline void hoseLedWrite(uint32_t duty) {
-  ledcWrite(HOSE_LED_LEDC_CH, duty);
 }
 #endif
 
