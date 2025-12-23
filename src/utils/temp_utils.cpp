@@ -1,0 +1,72 @@
+#include <Arduino.h>
+#include <DallasTemperature.h>
+
+#include "rig_globals.h"
+#include "temp_utils.h"
+
+String addressToString(const uint8_t addr[8]) {
+  char buf[17];
+  for (int i = 0; i < 8; i++) {
+    sprintf(&buf[i * 2], "%02X", addr[i]);
+  }
+  buf[16] = '\0';
+  return String(buf);
+}
+
+bool parseAddressString(const String& s, uint8_t addr[8]) {
+  if (s.length() != 16) return false;
+  auto hexVal = [](char c) -> int {
+    c = toupper((unsigned char)c);
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+  };
+  for (int i = 0; i < 8; i++) {
+    char high = s[2 * i];
+    char low  = s[2 * i + 1];
+    int hi = hexVal(high);
+    int lo = hexVal(low);
+    if (hi < 0 || lo < 0) return false;
+    addr[i] = (uint8_t)((hi << 4) | lo);
+  }
+  return true;
+}
+
+// Just for debugging: show discovered sensors & which are assigned
+void printDS18B20Addresses() {
+  Serial.println("=== Temp assignments restored from NVS ===");
+
+  Serial.printf("Iso HP:      '%s'\n", isoTempAddrStr.c_str());
+  Serial.printf("Resin HP:    '%s'\n", resinTempAddrStr.c_str());
+  Serial.printf("Iso Low:     '%s'\n", isoLowTempAddrStr.c_str());
+  Serial.printf("Resin Low:   '%s'\n", resinLowTempAddrStr.c_str());
+  Serial.printf("Hose 1:      '%s'\n", hose1TempAddrStr.c_str());
+  Serial.printf("Hose 2:      '%s'\n", hose2TempAddrStr.c_str());
+
+  Serial.printf(
+      "Assigned flags: iso=%d resin=%d isoLow=%d resinLow=%d hose1=%d hose2=%d\n",
+      (int)isoTempAssigned, (int)resinTempAssigned,
+      (int)isoLowTempAssigned, (int)resinLowTempAssigned,
+      (int)hose1TempAssigned, (int)hose2TempAssigned);
+
+  dsDeviceCount = tempSensors.getDeviceCount();
+  Serial.printf("Found %d DS18B20 device(s) on bus\n", dsDeviceCount);
+
+  for (int i = 0; i < dsDeviceCount; i++) {
+    DeviceAddress addr;
+    if (tempSensors.getAddress(addr, i)) {
+      String s = addressToString(addr);
+      Serial.printf("  Index %d address: %s\n", i, s.c_str());
+    } else {
+      Serial.printf("  Index %d: <no address>\n", i);
+    }
+  }
+
+  // Reprint assignments in a compact, aligned form
+  Serial.printf("Assigned Iso HP Temp:    %s\n", isoTempAddrStr.c_str());
+  Serial.printf("Assigned Resin HP Temp:  %s\n", resinTempAddrStr.c_str());
+  Serial.printf("Assigned Iso Low Temp:   %s\n", isoLowTempAddrStr.c_str());
+  Serial.printf("Assigned Resin Low Temp: %s\n", resinLowTempAddrStr.c_str());
+  Serial.printf("Assigned Hose 1 Temp:    %s\n", hose1TempAddrStr.c_str());
+  Serial.printf("Assigned Hose 2 Temp:    %s\n", hose2TempAddrStr.c_str());
+}

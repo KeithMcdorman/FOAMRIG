@@ -1,0 +1,787 @@
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WebServer.h>
+#include <WebSocketsServer.h>
+#include <Preferences.h>
+#include <ArduinoJson.h>
+#include <ESPmDNS.h>
+#include <Update.h>
+
+#include "rig_pins.h"
+#include "rig_globals.h"
+#include "hose_led.h"
+
+#include "utils_math.h"
+#include "sensors.h"
+#include "temp_utils.h"
+#include "interlock.h"
+
+// Forward declarations (implemented across modules)
+void setupWiFi();
+void handleWifiFallback();
+void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length);
+void handleRoot();
+void handleSettingsPage();
+void handleUpdatePage();
+void handleUpdateUpload();
+void handleSettings();
+void handleCalibration();
+void handleCalibrationStatus();
+void handleLiveStatus();
+void handleTempSensors();
+void handleControl();
+
+void setup() {
+  Serial.begin(115200);
+  delay(300);
+  Serial.println("\n=== Foam rig boot ===");
+
+  // HMI UART on GPIO16 (RX) and GPIO17 (TX)
+  HMISerial.begin(115200, SERIAL_8N1, 16, 17);
+  Serial.println("HMI UART started on GPIO16/17 @115200");
+
+
+  // Relay outputs
+  pinMode(RELAY_SPRAY_PIN, OUTPUT);
+  pinMode(RELAY_DRUM_AIR_PIN, OUTPUT);
+  pinMode(RELAY_HOSE1_PIN, OUTPUT);
+  pinMode(RELAY_HOSE2_PIN, OUTPUT);
+  digitalWrite(RELAY_SPRAY_PIN, LOW);
+  digitalWrite(RELAY_DRUM_AIR_PIN, LOW);
+  digitalWrite(RELAY_HOSE1_PIN, LOW);
+  digitalWrite(RELAY_HOSE2_PIN, LOW);
+
+
+  analogReadResolution(12);
+  analogSetPinAttenuation(SENSOR_A_PIN,         ADC_11db);
+  analogSetPinAttenuation(SENSOR_B_PIN,         ADC_11db);
+  analogSetPinAttenuation(SENSOR_AIRPISTON_PIN, ADC_11db);
+  analogSetPinAttenuation(SENSOR_APAIR_PIN,     ADC_11db);
+  analogSetPinAttenuation(SENSOR_ISO_LOW_PIN,    ADC_11db);
+  analogSetPinAttenuation(SENSOR_RESIN_LOW_PIN,  ADC_11db);
+  // Hose-tip LED (PWM)
+  hoseLedInit();
+  tempSensors.begin();
+
+  prefs.begin("foam", false);
+  targetPressure = prefs.getInt("target", 1000);
+  marginPercent  = prefs.getInt("margin", 10);
+  diffPressure   = prefs.getInt("diff", 50);
+  airTarget      = prefs.getInt("airTarget", 100);
+  gunTarget      = prefs.getInt("gunTarget", 100);
+  isoLowTarget   = prefs.getInt("isoLowTarget",   200);
+  resinLowTarget = prefs.getInt("resinLowTarget", 200);
+  supplyLowPSI   = prefs.getInt("supplyLow",      150);
+
+  isoTempTargetF      = prefs.getInt("isoTempTarget",   120);
+  resinTempTargetF    = prefs.getInt("resTempTarget",   120);
+  isoLowTempTargetF   = prefs.getInt("isoLowTempTgt",   isoTempTargetF);
+  resinLowTempTargetF = prefs.getInt("resLowTempTgt",   resinTempTargetF);
+  tempMinF            = prefs.getInt("tempMinF",        40);
+  tempMaxF            = prefs.getInt("tempMaxF",        180);
+
+  // Hose heat (2 zones)
+  hose1Enabled = prefs.getBool("hose1En", false);
+  hose2Enabled = prefs.getBool("hose2En", false);
+  hose1SetF    = prefs.getInt("hose1SetF", 125);
+  hose2SetF    = prefs.getInt("hose2SetF", 125);
+  hose1TolF    = prefs.getInt("hose1TolF", 3);
+  hose2TolF    = prefs.getInt("hose2TolF", 3);
+  hoseOvertempF = prefs.getInt("hoseOvertempF", 5);
+  if (hoseOvertempF < 1) hoseOvertempF = 1;
+  if (hoseOvertempF > 50) hoseOvertempF = 50;
+
+  // Safety: never energize hose heaters automatically on boot.
+  // After any reboot/power-cycle, the user must explicitly re-enable hose heat.
+  if (hose1Enabled || hose2Enabled) {
+    hose1Enabled = false;
+    hose2Enabled = false;
+    prefs.putBool("hose1En", false);
+    prefs.putBool("hose2En", false);
+  }
+
+
+  isoR0   = prefs.getFloat("iso_R0",   0.0f);
+  isoK    = prefs.getFloat("iso_K",    1.0f);
+  resinR0 = prefs.getFloat("resin_R0", 0.0f);
+  resinK  = prefs.getFloat("resin_K",  1.0f);
+  isoLowR0   = prefs.getFloat("isoLow_R0",   0.0f);
+  isoLowK    = prefs.getFloat("isoLow_K",    1.0f);
+  resinLowR0 = prefs.getFloat("resinLow_R0", 0.0f);
+  resinLowK  = prefs.getFloat("resinLow_K",  1.0f);
+  airR0   = prefs.getFloat("air_R0",   0.0f);
+  airK    = prefs.getFloat("air_K",    1.0f);
+  apAirR0 = prefs.getFloat("apAir_R0", 0.0f);
+  apAirK  = prefs.getFloat("apAir_K",  1.0f);
+
+  isoTempAddrStr      = prefs.getString("isoTempAddr",    "");
+  resinTempAddrStr    = prefs.getString("resTempAddr",    "");
+  isoLowTempAddrStr   = prefs.getString("isoLowTempAddr", "");
+  resinLowTempAddrStr = prefs.getString("resLowTempAddr", "");
+
+  hose1TempAddrStr    = prefs.getString("hose1TempAddr", "");
+  hose2TempAddrStr    = prefs.getString("hose2TempAddr", "");
+
+  isoTempAssigned      = parseAddressString(isoTempAddrStr,      isoTempAddr);
+  resinTempAssigned    = parseAddressString(resinTempAddrStr,    resinTempAddr);
+  isoLowTempAssigned   = parseAddressString(isoLowTempAddrStr,   isoLowTempAddr);
+  resinLowTempAssigned = parseAddressString(resinLowTempAddrStr, resinLowTempAddr);
+
+  // Hose heat temp sensor assignments (must be parsed at boot so live temps render)
+  hose1TempAssigned    = parseAddressString(hose1TempAddrStr, hose1TempAddr);
+  hose2TempAssigned    = parseAddressString(hose2TempAddrStr, hose2TempAddr);
+
+  networkMode = prefs.getInt("wifiMode", (int)NETMODE_AP);
+  apSsid      = prefs.getString("apSsid",  DEFAULT_AP_SSID);
+  apPass      = prefs.getString("apPass",  DEFAULT_AP_PASS);
+  staSsid     = prefs.getString("staSsid", "");
+  staPass     = prefs.getString("staPass", "");
+
+  // Defensive defaults: NVS can contain empty strings (e.g., after a bad save).
+  // WiFi.softAP() will fail if SSID is empty.
+  if (apSsid.length() == 0) {
+    apSsid = DEFAULT_AP_SSID;
+    prefs.putString("apSsid", apSsid);
+  }
+  if (apPass.length() == 0) {
+    apPass = DEFAULT_AP_PASS;
+    prefs.putString("apPass", apPass);
+  }
+
+  printDS18B20Addresses();
+
+  setupWiFi();
+
+  if (MDNS.begin("foam")) {
+    Serial.println("mDNS: foam.local");
+  } else {
+    Serial.println("mDNS failed");
+  }
+
+  server.on("/", HTTP_GET, handleRoot);
+  server.on("/settings", HTTP_GET, handleSettingsPage);
+  server.on("/api/settings", handleSettings);
+  server.on("/calibration", handleCalibration);
+  server.on("/calibration/status", HTTP_GET, handleCalibrationStatus);
+  server.on("/api/temp-sensors", handleTempSensors);
+  server.on("/api/control", handleControl);
+  server.on("/api/interlock/reset", HTTP_POST, handleInterlockReset);
+  server.on("/api/live", HTTP_GET, handleLiveStatus);
+
+  // OTA endpoints
+  server.on("/update", HTTP_GET, handleUpdatePage);
+  server.on(
+    "/update", HTTP_POST,
+    []() {
+      // Called when upload is finished
+      if (Update.hasError()) {
+        const char* failPage = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Firmware Update Failed</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <style>
+    body {
+      margin:0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:#020617;
+      color:#e5e7eb;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      min-height:100vh;
+    }
+    .card {
+      padding:1.25rem 1.5rem;
+      border-radius:16px;
+      border:1px solid #b91c1c;
+      background:#111827;
+      max-width:420px;
+    }
+    h1 { margin-top:0; font-size:1.1rem; color:#fecaca; }
+    p { font-size:0.85rem; color:#e5e7eb; }
+    a { color:#38bdf8; text-decoration:none; font-size:0.85rem; }
+  </style>
+</head>
+<body>
+  <div class="card">
+    <h1>Firmware Update Failed</h1>
+    <p>There was a problem writing the new firmware. Please verify the .bin file and try again.</p>
+    <p><a href="/update">Back to update page</a></p>
+  </div>
+</body>
+</html>
+)rawliteral";
+        server.send(500, "text/html", failPage);
+      } else {
+        const char* okPage = R"rawliteral(
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <title>Firmware Update OK</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <!-- Redirect to live page after 10 seconds -->
+  <meta http-equiv="refresh" content="10;url=/" />
+  <style>
+    body {
+      margin:0;
+      font-family: system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background:#020617;
+      color:#e5e7eb;
+      display:flex;
+      align-items:center;
+      justify-content:center;
+      min-height:100vh;
+    }
+    .card {
+      padding:1.25rem 1.5rem;
+      border-radius:16px;
+      border:1px solid #1e293b;
+      background:#020617;
+      max-width:420px;
+      text-align:center;
+    }
+    h1 { margin-top:0; font-size:1.1rem; }
+    p { font-size:0.85rem; color:#9ca3af; }
+    .countdown { font-weight:600; color:#38bdf8; }
+  </style>
+  <script>
+    // JS backup redirect + simple countdown
+    let remaining = 10;
+    function tick() {
+      var el = document.getElementById('countdown');
+      if (el) el.textContent = remaining;
+      if (remaining <= 0) {
+        window.location.href = '/';
+      } else {
+        remaining--;
+        setTimeout(tick, 1000);
+      }
+    }
+    window.addEventListener('DOMContentLoaded', tick);
+  </script>
+</head>
+<body>
+  <div class="card">
+    <h1>Firmware Update Successful</h1>
+    <p>The rig is rebooting into the new firmware.</p>
+    <p>Returning to the live dashboard in <span id="countdown" class="countdown">10</span> seconds…</p>
+    <p>If it doesn’t redirect automatically, you can <a href="/">tap here to go to the main page</a>.</p>
+  </div>
+</body>
+</html>
+)rawliteral";
+        server.send(200, "text/html", okPage);
+        // Give the response a moment to flush before reboot
+        delay(500);
+        ESP.restart();
+      }
+    },
+    handleUpdateUpload
+  );
+
+  server.begin();
+  Serial.println("HTTP server started");
+
+  webSocket.begin();
+  webSocket.onEvent(onWebSocketEvent);
+  Serial.println("WebSocket server started");
+}
+
+
+// -----------------------------------------------------------------------------
+// HMI UART polling and button handling (no JSON dependency)
+// -----------------------------------------------------------------------------
+
+// Read bytes from HMISerial, assemble into newline-terminated lines
+void hmiPollUart()
+{
+  while (HMISerial.available() > 0) {
+    char c = (char)HMISerial.read();
+
+    // Ignore CR, treat LF as line terminator
+    if (c == '\r') continue;
+
+    if (c == '\n') {
+      if (hmiRxBuffer.length() == 0) {
+        // Empty line, ignore
+        continue;
+      }
+
+      // Debug: show exactly what we received
+      Serial.print("RX line: [");
+      Serial.print(hmiRxBuffer);
+      Serial.println("]");
+
+      // Parse JSON commands from the HMI (ArduinoJson)
+      char first = hmiRxBuffer[0];
+      if (first == '{') {
+        // Newline-delimited JSON control messages from the HMI.
+        // This intentionally mirrors the Live page controls (/api/control), but without exposing Settings.
+        JsonDocument cmdDoc;
+        DeserializationError jerr = deserializeJson(cmdDoc, hmiRxBuffer);
+
+        if (!jerr) {
+          bool hoseTouched = false;
+
+          // ---- Optional request: state snapshot ----
+          // Accept {"cmd":"request_state"} or {"cmd":"state"} (also keeps legacy {"cmd":"..."} behavior below).
+          const char* cmd = cmdDoc["cmd"] | "";
+          if (cmd[0] != '\0') {
+            if (!strcmp(cmd, "request_state") || !strcmp(cmd, "state") || !strcmp(cmd, "live")) {
+              if (lastStatusJson.length()) {
+                HMISerial.write((const uint8_t*)lastStatusJson.c_str(), lastStatusJson.length());
+                HMISerial.write('\n');
+              }
+            }
+
+            // Legacy toggles: {"cmd":"drum"} / {"cmd":"spray"}
+            if (!strcmp(cmd, "drum")) {
+              bool desired = !drumAirEnabled; // toggle
+              drumAirEnabled = desired;
+              digitalWrite(RELAY_DRUM_AIR_PIN, drumAirEnabled ? HIGH : LOW);
+
+              // If you kill drum air, also drop spray as a safety
+              if (!drumAirEnabled) {
+                sprayEnabled = false;
+                digitalWrite(RELAY_SPRAY_PIN, LOW);
+              }
+            }
+            else if (!strcmp(cmd, "spray")) {
+              bool desired = !sprayEnabled; // toggle via legacy command
+              cmdDoc["spray"] = desired;    // normalize to set-style below
+            }
+          }
+
+          // ---- Set-style controls (preferred) ----
+          // Relays
+          if (cmdDoc["drumAir"].is<bool>() || cmdDoc["drumAir"].is<int>()) {
+            bool desired = (cmdDoc["drumAir"].as<int>() != 0);
+            drumAirEnabled = desired;
+            digitalWrite(RELAY_DRUM_AIR_PIN, drumAirEnabled ? HIGH : LOW);
+
+            if (!drumAirEnabled) {
+              sprayEnabled = false;
+              digitalWrite(RELAY_SPRAY_PIN, LOW);
+            }
+          }
+
+          // Hose enable
+          if (cmdDoc["hose1En"].is<bool>() || cmdDoc["hose1En"].is<int>()) {
+            hose1Enabled = (cmdDoc["hose1En"].as<int>() != 0);
+            prefs.putBool("hose1En", hose1Enabled);
+            if (!hose1Enabled) {
+              hose1Heating = false;
+              digitalWrite(RELAY_HOSE1_PIN, LOW);
+            }
+            hoseTouched = true;
+          }
+
+          if (cmdDoc["hose2En"].is<bool>() || cmdDoc["hose2En"].is<int>()) {
+            hose2Enabled = (cmdDoc["hose2En"].as<int>() != 0);
+            prefs.putBool("hose2En", hose2Enabled);
+            if (!hose2Enabled) {
+              hose2Heating = false;
+              digitalWrite(RELAY_HOSE2_PIN, LOW);
+            }
+            hoseTouched = true;
+          }
+
+          // Hose setpoints / swing ("Tol" on UI behaves as OFF swing above setpoint)
+          if (cmdDoc["hose1Set"].is<int>()) {
+            hose1SetF = constrain(cmdDoc["hose1Set"].as<int>(), 40, 200);
+            prefs.putInt("hose1SetF", hose1SetF);
+            hoseTouched = true;
+          }
+
+          if (cmdDoc["hose2Set"].is<int>()) {
+            hose2SetF = constrain(cmdDoc["hose2Set"].as<int>(), 40, 200);
+            prefs.putInt("hose2SetF", hose2SetF);
+            hoseTouched = true;
+          }
+
+          if (cmdDoc["hose1Tol"].is<int>()) {
+            hose1TolF = constrain(cmdDoc["hose1Tol"].as<int>(), 0, 50);
+            prefs.putInt("hose1TolF", hose1TolF);
+            hoseTouched = true;
+          }
+
+          if (cmdDoc["hose2Tol"].is<int>()) {
+            hose2TolF = constrain(cmdDoc["hose2Tol"].as<int>(), 0, 50);
+            prefs.putInt("hose2TolF", hose2TolF);
+            hoseTouched = true;
+          }
+
+          if (cmdDoc["hoseOvertempF"].is<int>()) {
+            hoseOvertempF = constrain(cmdDoc["hoseOvertempF"].as<int>(), 0, 50);
+            prefs.putInt("hoseOvertempF", hoseOvertempF);
+            hoseTouched = true;
+          }
+
+          if (hoseTouched) {
+            applyHoseHeatControl();
+          }
+
+          // Spray control: same guards as web UI
+          if (cmdDoc["spray"].is<bool>() || cmdDoc["spray"].is<int>()) {
+            bool desired = (cmdDoc["spray"].as<int>() != 0);
+
+            if (desired) {
+              // Block if hose overtemp is active or conditions exceed cutoff
+              if (hoseOvertempActive || !hoseOvertempConditionCleared()) {
+                sprayInterlockActive = true;
+                // Preserve the canonical HOSE OVERTEMP prefix for reset matching
+                if (hose1Enabled && !isnan(hose1TempF) && hose1TempF >= (float)(hose1SetF + hoseOvertempF)) {
+                  lastInterlockReason = String("Interlock: HOSE OVERTEMP - Hose 1 above cutoff.");
+                } else if (hose2Enabled && !isnan(hose2TempF) && hose2TempF >= (float)(hose2SetF + hoseOvertempF)) {
+                  lastInterlockReason = String("Interlock: HOSE OVERTEMP - Hose 2 above cutoff.");
+                } else {
+                  lastInterlockReason = String("Interlock: HOSE OVERTEMP - safety trip active.");
+                }
+
+                sprayEnabled = false;
+                digitalWrite(RELAY_SPRAY_PIN, LOW);
+              }
+              // Low-side supply guard
+              else if (!(lastIsoLowPSI >= supplyLowPSI && lastResinLowPSI >= supplyLowPSI)) {
+                sprayInterlockActive = true;
+                lastInterlockReason  = makeLowSupplyInterlockReason(lastIsoHPPSI, lastResinHPPSI,
+                                                                   lastIsoLowPSI, lastResinLowPSI,
+                                                                   supplyLowPSI);
+                sprayEnabled = false;
+                digitalWrite(RELAY_SPRAY_PIN, LOW);
+              }
+              // Drum air must be enabled to spray
+              else if (!drumAirEnabled) {
+                sprayInterlockActive = true;
+                lastInterlockReason  = String("Interlock: drum air not enabled.");
+                sprayEnabled = false;
+                digitalWrite(RELAY_SPRAY_PIN, LOW);
+              }
+              else {
+                // Preconditions OK – enable spray and clear spray interlock
+                sprayEnabled         = true;
+                digitalWrite(RELAY_SPRAY_PIN, HIGH);
+                sprayInterlockActive = false;
+                if (lastInterlockReason.indexOf("low supply pressure") >= 0 ||
+                    lastInterlockReason.indexOf("drum air not enabled") >= 0 ||
+                    lastInterlockReason.indexOf("HOSE OVERTEMP") >= 0) {
+                  lastInterlockReason = "";
+                }
+              }
+            } else {
+              sprayEnabled = false;
+              digitalWrite(RELAY_SPRAY_PIN, LOW);
+            }
+          }
+
+          // Interlock reset from HMI: {"resetInterlock":true} or {"interlockReset":true}
+          if ((cmdDoc["resetInterlock"].is<bool>() && (bool)cmdDoc["resetInterlock"]) ||
+              (cmdDoc["interlockReset"].is<bool>() && (bool)cmdDoc["interlockReset"]) ||
+              (cmdDoc["resetInterlock"].is<int>() && cmdDoc["resetInterlock"].as<int>() != 0) ||
+              (cmdDoc["interlockReset"].is<int>() && cmdDoc["interlockReset"].as<int>() != 0)) {
+
+            // Mirror the web reset behavior: only clear if triggering condition is cleared.
+            bool canClear = true;
+            String denyReason;
+
+            if (hoseOvertempActive || lastInterlockReason.indexOf("HOSE OVERTEMP") >= 0) {
+              canClear = hoseOvertempConditionCleared();
+              if (!canClear) denyReason = "Hose overtemp condition not cleared.";
+            } else if (lastInterlockReason.indexOf("low supply pressure") >= 0) {
+              canClear = lowSupplyConditionCleared();
+              if (!canClear) denyReason = "Low supply pressure condition not cleared.";
+            } else if (lastInterlockReason.indexOf("drum air not enabled") >= 0) {
+              canClear = drumAirEnabled;
+              if (!canClear) denyReason = "Drum air not enabled.";
+            }
+
+            if (canClear) {
+              sprayInterlockActive = false;
+              hoseOvertempActive   = false;
+              lastInterlockReason  = "";
+
+              sprayEnabled   = false;
+              drumAirEnabled = false;
+              digitalWrite(RELAY_SPRAY_PIN, LOW);
+              digitalWrite(RELAY_DRUM_AIR_PIN, LOW);
+
+              hose1Heating = false;
+              hose2Heating = false;
+              digitalWrite(RELAY_HOSE1_PIN, LOW);
+              digitalWrite(RELAY_HOSE2_PIN, LOW);
+
+              applyHoseHeatControl();
+            } else {
+              // Keep interlock latched; just log deny reason for debugging.
+              Serial.print("HMI reset denied: ");
+              Serial.println(denyReason);
+            }
+          }
+        } else {
+          Serial.print("HMI JSON parse error: ");
+          Serial.println(jerr.c_str());
+        }
+      }// Reset buffer for next line
+      hmiRxBuffer = "";
+    } else {
+      // Regular character – append as long as we don't overflow
+      if (hmiRxBuffer.length() < 255) {
+        hmiRxBuffer += c;
+      } else {
+        // Overflow safeguard – drop the line
+        hmiRxBuffer = "";
+      }
+    }
+  }
+}
+
+void loop() {
+  server.handleClient();
+  webSocket.loop();
+  handleWifiFallback();
+
+  // Poll UART link from HMI for control commands
+  hmiPollUart();
+
+
+  static unsigned long last         = 0;
+  static unsigned long lastTempRead = 0;
+
+  unsigned long now = millis();
+
+  if (now - last > 200) {
+    float rawIso      = readPSI_raw(SENSOR_A_PIN,         1600.0f);
+    float rawResin    = readPSI_raw(SENSOR_B_PIN,         1600.0f);
+    float rawIsoLow   = readPSI_raw(SENSOR_ISO_LOW_PIN,    500.0f);
+    float rawResinLow = readPSI_raw(SENSOR_RESIN_LOW_PIN,  500.0f);
+    float rawAir      = readPSI_raw(SENSOR_AIRPISTON_PIN,  300.0f);
+    float rawApAir    = readPSI_raw(SENSOR_APAIR_PIN,      300.0f);
+
+    float isoPSI       = applyCalibration(rawIso,      isoR0,      isoK,      1600.0f);
+    float resinPSI     = applyCalibration(rawResin,    resinR0,    resinK,    1600.0f);
+    float isoLowPSI    = applyCalibration(rawIsoLow,   isoLowR0,   isoLowK,    500.0f);
+    float resinLowPSI  = applyCalibration(rawResinLow, resinLowR0, resinLowK,  500.0f);
+    float airPistonPSI = applyCalibration(rawAir,      airR0,      airK,       300.0f);
+    float apAirPSI     = applyCalibration(rawApAir,    apAirR0,    apAirK,     300.0f);
+
+    // Cache latest readings for UI banners / interlock snapshot text.
+    lastIsoHPPSI   = isoPSI;
+    lastResinHPPSI = resinPSI;
+    lastIsoLowPSI   = isoLowPSI;
+    lastResinLowPSI = resinLowPSI;
+
+    // Auto-interlock: if in Spray mode and either low side drops below threshold,
+    // park (spray off) and shut off drum pump air.
+    if (sprayEnabled && (isoLowPSI < supplyLowPSI || resinLowPSI < supplyLowPSI)) {
+      Serial.println("Supply low: auto park & drum air off");
+      sprayEnabled   = false;
+      drumAirEnabled = false;
+      digitalWrite(RELAY_SPRAY_PIN, LOW);
+      digitalWrite(RELAY_DRUM_AIR_PIN, LOW);
+      sprayInterlockActive = true;
+      lastInterlockReason  = makeLowSupplyInterlockReason(isoPSI, resinPSI,
+                                                         isoLowPSI, resinLowPSI,
+                                                         supplyLowPSI);
+    }
+
+    // --- Hose-tip LED mode based on Iso HP vs green band ---
+    float bandFrac = marginPercent / 100.0f;
+    if (bandFrac < 0.0f) bandFrac = 0.0f;
+    if (bandFrac > 1.0f) bandFrac = 1.0f;
+
+    float isoBandLow  = targetPressure * (1.0f - bandFrac);
+    float isoBandHigh = targetPressure * (1.0f + bandFrac);
+
+    if (isoPSI <= 0.0f) {
+      // Rig idle
+      hoseLedMode = HOSE_LED_PULSE;
+    } else if (isoPSI < isoBandLow) {
+      // Below green band → slow blink
+      hoseLedMode = HOSE_LED_BLINK_SLOW;
+    } else if (isoPSI > isoBandHigh) {
+      // Above green band / setpoint → fast blink
+      hoseLedMode = HOSE_LED_BLINK_FAST;
+    } else {
+      // Within green band → solid
+      hoseLedMode = HOSE_LED_SOLID;
+    }
+
+    // Update hose heat relays/state before we publish status
+    applyHoseHeatControl();
+
+    // Build status JSON for WebSocket + HMI UART (ArduinoJson)
+    JsonDocument doc;
+
+    // Pressures
+    doc["iso"]      = round1(isoPSI);
+    doc["resin"]    = round1(resinPSI);
+    doc["isoLow"]   = round1(isoLowPSI);
+    doc["resinLow"] = round1(resinLowPSI);
+    doc["airPiston"]= round1(airPistonPSI);
+    doc["apAir"]    = round1(apAirPSI);
+
+    // Temps (only include when valid)
+    if (!isnan(isoTempF))       doc["isoTemp"]      = round1(isoTempF);
+    if (!isnan(resinTempF))     doc["resinTemp"]    = round1(resinTempF);
+    if (!isnan(isoLowTempF))    doc["isoLowTemp"]   = round1(isoLowTempF);
+    if (!isnan(resinLowTempF))  doc["resinLowTemp"] = round1(resinLowTempF);
+
+    // Relay / mode states (0/1 so JS + LVGL can treat them as booleans)
+    doc["drumAir"] = drumAirEnabled ? 1 : 0;
+    doc["spray"]   = sprayEnabled   ? 1 : 0;
+
+    // Hose heat (2 zones)
+    doc["hose1En"]   = hose1Enabled ? 1 : 0;
+    doc["hose2En"]   = hose2Enabled ? 1 : 0;
+    doc["hose1Heat"] = hose1Heating ? 1 : 0;
+    doc["hose2Heat"] = hose2Heating ? 1 : 0;
+    doc["hose1Set"]  = hose1SetF;
+    doc["hose2Set"]  = hose2SetF;
+    doc["hose1Tol"]  = hose1TolF;
+    doc["hose2Tol"]  = hose2TolF;
+    doc["hoseOvertempF"] = hoseOvertempF;
+    doc["hoseOvertemp"]  = hoseOvertempActive ? 1 : 0;
+    if (!isnan(hose1TempF)) doc["hose1Temp"] = round1(hose1TempF);
+    if (!isnan(hose2TempF)) doc["hose2Temp"] = round1(hose2TempF);
+    doc["hose1Status"] = hoseStatusText(hose1Enabled, hose1Heating, hose1TempF, hose1SetF, hose1TolF);
+    doc["hose2Status"] = hoseStatusText(hose2Enabled, hose2Heating, hose2TempF, hose2SetF, hose2TolF);
+
+    // Firmware and configuration (mirrors the web UI expectations)
+    doc["fw"]             = FW_VERSION;
+    doc["target"]         = targetPressure;
+    doc["margin"]         = marginPercent;
+    doc["diff"]           = diffPressure;
+    doc["airTarget"]      = airTarget;
+    doc["gunTarget"]      = gunTarget;
+    doc["isoLowTarget"]   = isoLowTarget;
+    doc["resinLowTarget"] = resinLowTarget;
+    doc["supplyLow"]      = supplyLowPSI;
+
+    doc["isoTempTarget"]      = isoTempTargetF;
+    doc["resinTempTarget"]    = resinTempTargetF;
+    doc["isoLowTempTarget"]   = isoLowTempTargetF;
+    doc["resinLowTempTarget"] = resinLowTempTargetF;
+    doc["tempMinF"]           = tempMinF;
+    doc["tempMaxF"]           = tempMaxF;
+
+    // Always include an interlock field so the UI can clear the red state
+    if (sprayInterlockActive && lastInterlockReason.length() > 0) {
+      doc["interlock"] = lastInterlockReason;
+    } else {
+      doc["interlock"] = nullptr;
+    }
+
+    size_t n = serializeJson(doc, statusJsonBuf, sizeof(statusJsonBuf));
+    if (n > 0) {
+      lastStatusJson = statusJsonBuf;
+      webSocket.broadcastTXT(statusJsonBuf, n);
+      HMISerial.write((const uint8_t*)statusJsonBuf, n);
+      HMISerial.write('\n');
+    }
+
+    last = now;
+  }
+
+
+// --- Drive hose-tip LED according to hoseLedMode ---
+  static bool hoseLedState = false;
+  static unsigned long lastHoseLedToggle = 0;
+
+  unsigned long interval = 0;
+
+  switch (hoseLedMode) {
+    case HOSE_LED_SOLID:
+      // Solid ON whenever Iso HP is inside green band
+      hoseLedWrite(HOSE_LED_MAX_DUTY);
+      hoseLedState = true;
+      break;
+
+    case HOSE_LED_BLINK_SLOW:
+      // Slow blink below green band
+      interval = 700; // ms
+      break;
+
+    case HOSE_LED_BLINK_FAST:
+      // Fast blink above band / setpoint
+      interval = 220; // ms
+      break;
+
+    case HOSE_LED_PULSE: {
+      // Rig standby: slow "breathing" pulse for controller-alive feedback
+      static const uint32_t periodMs = 2600; // full fade in+out
+      uint32_t t = now % periodMs;
+      float phase = (float)t / (float)periodMs;                 // 0..1
+      float level = 0.5f - 0.5f * cosf(6.2831853f * phase);     // 0..1
+      uint32_t duty = (uint32_t)(level * (float)HOSE_LED_MAX_DUTY + 0.5f);
+      hoseLedWrite(duty);
+      hoseLedState = (duty > 0);
+      break;
+    }
+
+    case HOSE_LED_OFF:
+    default:
+      hoseLedWrite(0);
+      hoseLedState = false;
+      break;
+  }
+
+  if (hoseLedMode == HOSE_LED_BLINK_SLOW || hoseLedMode == HOSE_LED_BLINK_FAST) {
+    if (now - lastHoseLedToggle >= interval) {
+      hoseLedState = !hoseLedState;
+      hoseLedWrite(hoseLedState ? HOSE_LED_MAX_DUTY : 0);
+      lastHoseLedToggle = now;
+    }
+  }
+  // Temp read every ~1 s using assigned ROM addresses (no auto-pick)
+  if (now - lastTempRead > 1000) {
+    tempSensors.requestTemperatures();
+
+    if (isoTempAssigned) {
+      float tC = tempSensors.getTempC(isoTempAddr);
+      if (tC > -100.0f) {
+        isoTempF = tC * 9.0f / 5.0f + 32.0f;
+      }
+    }
+
+    if (resinTempAssigned) {
+      float tC = tempSensors.getTempC(resinTempAddr);
+      if (tC > -100.0f) {
+        resinTempF = tC * 9.0f / 5.0f + 32.0f;
+      }
+    }
+
+    if (isoLowTempAssigned) {
+      float tC = tempSensors.getTempC(isoLowTempAddr);
+      if (tC > -100.0f) {
+        isoLowTempF = tC * 9.0f / 5.0f + 32.0f;
+      }
+    }
+
+    if (resinLowTempAssigned) {
+      float tC = tempSensors.getTempC(resinLowTempAddr);
+      if (tC > -100.0f) {
+        resinLowTempF = tC * 9.0f / 5.0f + 32.0f;
+      }
+    }
+    if (hose1TempAssigned) {
+      float tC = tempSensors.getTempC(hose1TempAddr);
+      if (tC > -100.0f) {
+        hose1TempF = tC * 9.0f / 5.0f + 32.0f;
+      }
+    }
+
+    if (hose2TempAssigned) {
+      float tC = tempSensors.getTempC(hose2TempAddr);
+      if (tC > -100.0f) {
+        hose2TempF = tC * 9.0f / 5.0f + 32.0f;
+      }
+    }
+
+
+    lastTempRead = now;
+  }
+}

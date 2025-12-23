@@ -1,0 +1,139 @@
+float readPSI_raw(int pin, float fullScalePsi) {
+  const int samples = 8;
+  uint32_t sum = 0;
+  for (int i = 0; i < samples; i++) {
+    sum += analogRead(pin);
+    delayMicroseconds(200);
+  }
+  int adc = sum / samples;
+  float vEsp = (adc / 4095.0f) * 3.3f;
+  const float R_top = 10000.0f;
+  const float R_bottom = 22000.0f;
+  const float dividerRatio = R_bottom / (R_top + R_bottom);
+  float vSensor = vEsp / dividerRatio;
+  float psi = (vSensor - 0.5f) * (fullScalePsi / 4.0f);
+  return psi;
+}
+
+// Apply zero/span calibration and clamp
+float applyCalibration(float raw, float R0, float K, float fullScalePsi) {
+  float p = (raw - R0) * K;
+  if (p < 0) p = 0;
+  if (p > fullScalePsi) p = fullScalePsi;
+  return p;
+}
+
+// ---------- Hose heat control logic ----------
+// "Swing" controller (asymmetric hysteresis):
+//   - Heater turns ON when cooling down to the setpoint (temp <= set)
+//   - Heater turns OFF once it reaches (set + swing)
+// This minimizes cycling and matches slow hose thermal response.
+// Disabled or missing sensor => relay OFF.
+
+static inline void applyHoseHeatZone(bool enabled, float tempF, int setF, int swingF, bool& heating, int relayPin)
+{
+  if (!enabled) {
+    heating = false;
+    digitalWrite(relayPin, LOW);
+    return;
+  }
+  if (isnan(tempF)) {
+    heating = false;
+    digitalWrite(relayPin, LOW);
+    return;
+  }
+
+  // ON at setpoint (cooling down):
+  // OFF at set + swing (warming up):
+  const float onAt  = (float)setF;
+  const float offAt = (float)setF + (float)swingF;
+
+  if (!heating && tempF <= onAt) {
+    heating = true;
+  } else if (heating && tempF >= offAt) {
+    heating = false;
+  }
+
+  digitalWrite(relayPin, heating ? HIGH : LOW);
+}
+
+
+static inline void tripHoseOvertemp(const char* zoneLabel, float tempF, int setF)
+{
+  if (!hoseOvertempActive) {
+    hoseOvertempActive = true;
+  }
+
+  // Latch an interlock + park system + drop all hose heat outputs
+  sprayInterlockActive = true;
+
+  char buf[196];
+  snprintf(buf, sizeof(buf),
+           "Interlock: HOSE OVERTEMP - %s %.1f°F > %d°F + %d°F. Heaters OFF, system PARKED.",
+           zoneLabel, tempF, setF, hoseOvertempF);
+  lastInterlockReason = String(buf);
+
+  // Park system and cut drum air (conservative safe state)
+  sprayEnabled = false;
+  drumAirEnabled = false;
+  digitalWrite(RELAY_SPRAY_PIN, LOW);
+  digitalWrite(RELAY_DRUM_AIR_PIN, LOW);
+
+  // Drop hose relays immediately
+  hose1Heating = false;
+  hose2Heating = false;
+  digitalWrite(RELAY_HOSE1_PIN, LOW);
+  digitalWrite(RELAY_HOSE2_PIN, LOW);
+
+  // Critical: also DISABLE hose heat so nothing can re-energize unexpectedly.
+  // This is latched (persisted) so a reboot does not automatically restore heat.
+  hose1Enabled = false;
+  hose2Enabled = false;
+  prefs.putBool("hose1En", false);
+  prefs.putBool("hose2En", false);
+}
+
+static inline void applyHoseHeatControl()
+{
+  // Safety: if hose overtemp trip is active, force all hose heat relays OFF.
+  if (hoseOvertempActive) {
+    // Also ensure hose heat is disabled (UI shows OFF/Standby) and can't resume.
+    if (hose1Enabled || hose2Enabled) {
+      hose1Enabled = false;
+      hose2Enabled = false;
+      prefs.putBool("hose1En", false);
+      prefs.putBool("hose2En", false);
+    }
+    hose1Heating = false;
+    hose2Heating = false;
+    digitalWrite(RELAY_HOSE1_PIN, LOW);
+    digitalWrite(RELAY_HOSE2_PIN, LOW);
+    return;
+  }
+
+  // Safety trip: if a hose exceeds (setpoint + hoseOvertempF), park and drop heaters.
+  if (hose1Enabled && !isnan(hose1TempF) && hose1TempF >= (float)(hose1SetF + hoseOvertempF)) {
+    tripHoseOvertemp("Hose 1", hose1TempF, hose1SetF);
+    return;
+  }
+  if (hose2Enabled && !isnan(hose2TempF) && hose2TempF >= (float)(hose2SetF + hoseOvertempF)) {
+    tripHoseOvertemp("Hose 2", hose2TempF, hose2SetF);
+    return;
+  }
+
+  applyHoseHeatZone(hose1Enabled, hose1TempF, hose1SetF, hose1TolF, hose1Heating, RELAY_HOSE1_PIN);
+  applyHoseHeatZone(hose2Enabled, hose2TempF, hose2SetF, hose2TolF, hose2Heating, RELAY_HOSE2_PIN);
+}
+
+static inline const char* hoseStatusText(bool enabled, bool heating, float tempF, int setF, int swingF)
+{
+  if (!enabled) return "OFF";
+  if (isnan(tempF)) return "NO_SENSOR";
+  if (heating) return "HEATING";
+  // enabled, valid sensor, not heating
+  (void)setF;
+  (void)swingF;
+  return "AT_TEMP";
+}
+
+// /api/settings

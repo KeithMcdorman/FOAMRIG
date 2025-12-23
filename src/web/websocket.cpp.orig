@@ -1,0 +1,9 @@
+void onWebSocketEvent(uint8_t num, WStype_t type, uint8_t* payload, size_t length) {
+  if (type == WStype_CONNECTED) {
+    Serial.printf("WebSocket client #%u connected\n", num);
+  } else if (type == WStype_DISCONNECTED) {
+    Serial.printf("WebSocket client #%u disconnected\n", num);
+  }
+}
+
+// Convert ADC reading from a 0.5–4.5 V pressure transducer to PSI based on its full-scale range
