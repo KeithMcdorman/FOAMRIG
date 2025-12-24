@@ -86,7 +86,7 @@ extern float resinLowK;
 extern bool drumAirEnabled;
 extern bool sprayEnabled;
 
-// Manual overrides (Preferences-backed)
+// Manual relay overrides (Settings-driven)
 extern bool forceDrumAirOverride;
 extern bool forceSprayOverride;
 

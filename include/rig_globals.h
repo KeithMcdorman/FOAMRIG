@@ -82,6 +82,11 @@ extern float resinLowK;
 extern bool drumAirEnabled;
 extern bool sprayEnabled;
 
+// Manual relay overrides (Settings-driven)
+// When true, the corresponding relay output is forced ON regardless of alarm/interlock state.
+extern bool forceDrumAirOverride;
+extern bool forceSprayOverride;
+
 extern float lastIsoLowPSI;
 extern float lastResinLowPSI;
 extern float lastIsoHPPSI;
