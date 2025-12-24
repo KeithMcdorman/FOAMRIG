@@ -86,6 +86,10 @@ extern float resinLowK;
 extern bool drumAirEnabled;
 extern bool sprayEnabled;
 
+// Manual overrides (Preferences-backed)
+extern bool forceDrumAirOverride;
+extern bool forceSprayOverride;
+
 extern float lastIsoLowPSI;
 extern float lastResinLowPSI;
 extern float lastIsoHPPSI;

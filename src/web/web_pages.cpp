@@ -1952,6 +1952,17 @@ const char* settingsPage = R"rawliteral(
     .ok { color: #22c55e; font-weight: 600; }
     .warn { color: #facc15; font-weight: 600; }
     .bad { color: #ef4444; font-weight: 600; }
+
+    /* Slider toggles (manual overrides) */
+    .toggle-row { display:flex; align-items:center; justify-content:space-between; gap:12px; }
+    .switch { position: relative; display: inline-block; width: 54px; height: 30px; flex: 0 0 auto; }
+    .switch input { opacity: 0; width: 0; height: 0; }
+    .slider { position:absolute; cursor:pointer; top:0; left:0; right:0; bottom:0;
+              background-color:#334155; transition:.2s; border-radius: 999px; }
+    .slider:before { position:absolute; content:""; height:24px; width:24px; left:3px; bottom:3px;
+                     background-color:white; transition:.2s; border-radius: 999px; }
+    .switch input:checked + .slider { background-color:#22c55e; }
+    .switch input:checked + .slider:before { transform: translateX(24px); }
     @media (max-width: 800px) {
       form { grid-template-columns: 1fr; }
     }
@@ -1990,6 +2001,31 @@ const char* settingsPage = R"rawliteral(
         <label for="diffInput">Max Iso/Resin Difference (PSI)</label>
         <input type="number" id="diffInput" name="diff" min="0" max="1600" />
         <div class="hint">Used for ratio indicator and quick checks.</div>
+      </div>
+
+      <div class="field">
+        <label>Manual Overrides</label>
+        <div class="toggle-row">
+          <div>
+            <div><strong>Force Drum Air Relay ON</strong></div>
+            <div class="hint">For troubleshooting: forces drum air output on regardless of alarms/interlocks.</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="forceDrumAirToggle" />
+            <span class="slider"></span>
+          </label>
+        </div>
+        <div style="height:10px"></div>
+        <div class="toggle-row">
+          <div>
+            <div><strong>Force Spray Relay ON</strong></div>
+            <div class="hint">For troubleshooting: forces spray output on regardless of alarms/interlocks.</div>
+          </div>
+          <label class="switch">
+            <input type="checkbox" id="forceSprayToggle" />
+            <span class="slider"></span>
+          </label>
+        </div>
       </div>
     </fieldset>
 
@@ -2293,6 +2329,12 @@ const char* settingsPage = R"rawliteral(
     document.getElementById('targetInput').value = data.target;
     document.getElementById('marginInput').value = data.margin;
     document.getElementById('diffInput').value   = data.diff;
+    if (data.forceDrumAir !== undefined) {
+      document.getElementById('forceDrumAirToggle').checked = !!data.forceDrumAir;
+    }
+    if (data.forceSpray !== undefined) {
+      document.getElementById('forceSprayToggle').checked = !!data.forceSpray;
+    }
     if (data.airTarget !== undefined) {
       document.getElementById('airTargetInput').value = data.airTarget;
     }
@@ -2496,6 +2538,9 @@ const char* settingsPage = R"rawliteral(
     var margin = parseInt(document.getElementById('marginInput').value || '0', 10);
     var diff   = parseInt(document.getElementById('diffInput').value   || '0', 10);
 
+    var forceDrumAirVal = !!document.getElementById('forceDrumAirToggle').checked;
+    var forceSprayVal   = !!document.getElementById('forceSprayToggle').checked;
+
     var airTargetVal      = parseInt(document.getElementById('airTargetInput').value      || '0', 10);
     var gunTargetVal      = parseInt(document.getElementById('gunTargetInput').value      || '0', 10);
     var isoLowTargetVal   = parseInt(document.getElementById('isoLowTargetInput').value   || '0', 10);
@@ -2532,6 +2577,8 @@ const char* settingsPage = R"rawliteral(
       target: target,
       margin: margin,
       diff: diff,
+      forceDrumAir: forceDrumAirVal,
+      forceSpray: forceSprayVal,
       airTarget: airTargetVal,
       gunTarget: gunTargetVal,
       isoLowTarget: isoLowTargetVal,

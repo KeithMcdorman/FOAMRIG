@@ -31,6 +31,16 @@ void handleLiveStatus();
 void handleTempSensors();
 void handleControl();
 
+// Apply relay outputs, honoring manual override flags.
+// If an override is enabled, that relay will be forced ON regardless of alarm/interlock logic.
+static inline void applyRelayOutputs()
+{
+  const bool drumOut  = (drumAirEnabled || forceDrumAirOverride);
+  const bool sprayOut = (sprayEnabled   || forceSprayOverride);
+  digitalWrite(RELAY_DRUM_AIR_PIN, drumOut ? HIGH : LOW);
+  digitalWrite(RELAY_SPRAY_PIN,    sprayOut ? HIGH : LOW);
+}
+
 void setup() {
   Serial.begin(115200);
   delay(300);
@@ -72,6 +82,10 @@ void setup() {
   isoLowTarget   = prefs.getInt("isoLowTarget",   200);
   resinLowTarget = prefs.getInt("resinLowTarget", 200);
   supplyLowPSI   = prefs.getInt("supplyLow",      150);
+
+  // Manual relay overrides (troubleshooting)
+  forceDrumAirOverride = prefs.getBool("forceDrumAir", false);
+  forceSprayOverride   = prefs.getBool("forceSpray",   false);
 
   isoTempTargetF      = prefs.getInt("isoTempTarget",   120);
   resinTempTargetF    = prefs.getInt("resTempTarget",   120);
@@ -342,12 +356,15 @@ void hmiPollUart()
             if (!strcmp(cmd, "drum")) {
               bool desired = !drumAirEnabled; // toggle
               drumAirEnabled = desired;
-              digitalWrite(RELAY_DRUM_AIR_PIN, drumAirEnabled ? HIGH : LOW);
+              applyRelayOutputs();
 
               // If you kill drum air, also drop spray as a safety
               if (!drumAirEnabled) {
-                sprayEnabled = false;
-                digitalWrite(RELAY_SPRAY_PIN, LOW);
+                // Only drop spray if not manually forcing the spray relay on.
+                if (!forceSprayOverride) {
+                  sprayEnabled = false;
+                }
+                applyRelayOutputs();
               }
             }
             else if (!strcmp(cmd, "spray")) {
@@ -361,11 +378,13 @@ void hmiPollUart()
           if (cmdDoc["drumAir"].is<bool>() || cmdDoc["drumAir"].is<int>()) {
             bool desired = (cmdDoc["drumAir"].as<int>() != 0);
             drumAirEnabled = desired;
-            digitalWrite(RELAY_DRUM_AIR_PIN, drumAirEnabled ? HIGH : LOW);
+            applyRelayOutputs();
 
             if (!drumAirEnabled) {
-              sprayEnabled = false;
-              digitalWrite(RELAY_SPRAY_PIN, LOW);
+              if (!forceSprayOverride) {
+                sprayEnabled = false;
+              }
+              applyRelayOutputs();
             }
           }
 
@@ -443,7 +462,7 @@ void hmiPollUart()
                 }
 
                 sprayEnabled = false;
-                digitalWrite(RELAY_SPRAY_PIN, LOW);
+                applyRelayOutputs();
               }
               // Low-side supply guard
               else if (!(lastIsoLowPSI >= supplyLowPSI && lastResinLowPSI >= supplyLowPSI)) {
@@ -452,19 +471,19 @@ void hmiPollUart()
                                                                    lastIsoLowPSI, lastResinLowPSI,
                                                                    supplyLowPSI);
                 sprayEnabled = false;
-                digitalWrite(RELAY_SPRAY_PIN, LOW);
+                applyRelayOutputs();
               }
               // Drum air must be enabled to spray
               else if (!drumAirEnabled) {
                 sprayInterlockActive = true;
                 lastInterlockReason  = String("Interlock: drum air not enabled.");
                 sprayEnabled = false;
-                digitalWrite(RELAY_SPRAY_PIN, LOW);
+                applyRelayOutputs();
               }
               else {
                 // Preconditions OK – enable spray and clear spray interlock
                 sprayEnabled         = true;
-                digitalWrite(RELAY_SPRAY_PIN, HIGH);
+                applyRelayOutputs();
                 sprayInterlockActive = false;
                 if (lastInterlockReason.indexOf("low supply pressure") >= 0 ||
                     lastInterlockReason.indexOf("drum air not enabled") >= 0 ||
@@ -474,7 +493,7 @@ void hmiPollUart()
               }
             } else {
               sprayEnabled = false;
-              digitalWrite(RELAY_SPRAY_PIN, LOW);
+              applyRelayOutputs();
             }
           }
 
@@ -506,8 +525,14 @@ void hmiPollUart()
 
               sprayEnabled   = false;
               drumAirEnabled = false;
-              digitalWrite(RELAY_SPRAY_PIN, LOW);
-              digitalWrite(RELAY_DRUM_AIR_PIN, LOW);
+
+              // Clear manual overrides on reset to return to known-safe state.
+              forceSprayOverride   = false;
+              forceDrumAirOverride = false;
+              prefs.putBool("forceSpray",   forceSprayOverride);
+              prefs.putBool("forceDrumAir", forceDrumAirOverride);
+
+              applyRelayOutputs();
 
               hose1Heating = false;
               hose2Heating = false;
@@ -580,8 +605,7 @@ void loop() {
       Serial.println("Supply low: auto park & drum air off");
       sprayEnabled   = false;
       drumAirEnabled = false;
-      digitalWrite(RELAY_SPRAY_PIN, LOW);
-      digitalWrite(RELAY_DRUM_AIR_PIN, LOW);
+      applyRelayOutputs();
       sprayInterlockActive = true;
       lastInterlockReason  = makeLowSupplyInterlockReason(isoPSI, resinPSI,
                                                          isoLowPSI, resinLowPSI,
@@ -631,8 +655,12 @@ void loop() {
     if (!isnan(resinLowTempF))  doc["resinLowTemp"] = round1(resinLowTempF);
 
     // Relay / mode states (0/1 so JS + LVGL can treat them as booleans)
-    doc["drumAir"] = drumAirEnabled ? 1 : 0;
-    doc["spray"]   = sprayEnabled   ? 1 : 0;
+    const bool drumOut  = (drumAirEnabled || forceDrumAirOverride);
+    const bool sprayOut = (sprayEnabled   || forceSprayOverride);
+    doc["drumAir"] = drumOut  ? 1 : 0;
+    doc["spray"]   = sprayOut ? 1 : 0;
+    doc["forceDrumAir"] = forceDrumAirOverride ? 1 : 0;
+    doc["forceSpray"]   = forceSprayOverride   ? 1 : 0;
 
     // Hose heat (2 zones)
     doc["hose1En"]   = hose1Enabled ? 1 : 0;

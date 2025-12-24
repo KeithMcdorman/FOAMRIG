@@ -25,6 +25,9 @@ void handleSettings() {
     doc["target"]         = targetPressure;
     doc["margin"]         = marginPercent;
     doc["diff"]           = diffPressure;
+    // Manual relay overrides
+    doc["forceDrumAir"]   = forceDrumAirOverride;
+    doc["forceSpray"]     = forceSprayOverride;
     doc["airTarget"]      = airTarget;
     doc["gunTarget"]      = gunTarget;
     doc["isoLowTarget"]   = isoLowTarget;
@@ -67,6 +70,8 @@ void handleSettings() {
     targetPressure      = doc["target"]         | targetPressure;
     marginPercent       = doc["margin"]         | marginPercent;
     diffPressure        = doc["diff"]           | diffPressure;
+    if (doc["forceDrumAir"].is<bool>()) forceDrumAirOverride = doc["forceDrumAir"];
+    if (doc["forceSpray"].is<bool>())   forceSprayOverride   = doc["forceSpray"];
     airTarget           = doc["airTarget"]      | airTarget;
     gunTarget           = doc["gunTarget"]      | gunTarget;
     isoLowTarget        = doc["isoLowTarget"]   | isoLowTarget;
@@ -133,6 +138,10 @@ void handleSettings() {
     prefs.putInt("target",         targetPressure);
     prefs.putInt("margin",         marginPercent);
     prefs.putInt("diff",           diffPressure);
+
+    // Manual relay overrides
+    prefs.putBool("forceDrumAir", forceDrumAirOverride);
+    prefs.putBool("forceSpray",   forceSprayOverride);
     prefs.putInt("airTarget",      airTarget);
     prefs.putInt("gunTarget",      gunTarget);
     prefs.putInt("isoLowTarget",   isoLowTarget);
@@ -483,11 +492,13 @@ void handleControl() {
   if (doc["drumAir"].is<bool>()) {
     bool desired = doc["drumAir"];
     drumAirEnabled = desired;
-    digitalWrite(RELAY_DRUM_AIR_PIN, drumAirEnabled ? HIGH : LOW);
+    digitalWrite(RELAY_DRUM_AIR_PIN, (drumAirEnabled || forceDrumAirOverride) ? HIGH : LOW);
     if (!drumAirEnabled) {
       // if you kill drum air, also drop spray as a safety
-      sprayEnabled = false;
-      digitalWrite(RELAY_SPRAY_PIN, LOW);
+      if (!forceSprayOverride) {
+        sprayEnabled = false;
+      }
+      digitalWrite(RELAY_SPRAY_PIN, (sprayEnabled || forceSprayOverride) ? HIGH : LOW);
     }
   }
 
@@ -567,12 +578,12 @@ void handleControl() {
 
       // Preconditions are good – enable spray and clear any latched interlock
       sprayEnabled = true;
-      digitalWrite(RELAY_SPRAY_PIN, HIGH);
+      digitalWrite(RELAY_SPRAY_PIN, (sprayEnabled || forceSprayOverride) ? HIGH : LOW);
       sprayInterlockActive = false;
       lastInterlockReason  = "";
     } else {
       sprayEnabled = false;
-      digitalWrite(RELAY_SPRAY_PIN, LOW);
+      digitalWrite(RELAY_SPRAY_PIN, (sprayEnabled || forceSprayOverride) ? HIGH : LOW);
     }
   }
 
@@ -732,8 +743,15 @@ void handleInterlockReset()
 
   sprayEnabled   = false;
   drumAirEnabled = false;
-  digitalWrite(RELAY_SPRAY_PIN, LOW);
-  digitalWrite(RELAY_DRUM_AIR_PIN, LOW);
+
+  // Also clear manual overrides on reset so the system returns to a known-safe state.
+  forceSprayOverride   = false;
+  forceDrumAirOverride = false;
+  prefs.putBool("forceSpray",   forceSprayOverride);
+  prefs.putBool("forceDrumAir", forceDrumAirOverride);
+
+  digitalWrite(RELAY_SPRAY_PIN,    (sprayEnabled || forceSprayOverride) ? HIGH : LOW);
+  digitalWrite(RELAY_DRUM_AIR_PIN, (drumAirEnabled || forceDrumAirOverride) ? HIGH : LOW);
 
   hose1Heating = false;
   hose2Heating = false;

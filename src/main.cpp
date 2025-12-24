@@ -242,6 +242,11 @@ float resinLowK  = 1.0f;
 bool drumAirEnabled = false;  // relay on 26
 bool sprayEnabled   = false;  // relay on 25
 
+// Manual relay overrides (Settings)
+// When enabled, these force the corresponding relay output ON regardless of alarm/interlock conditions.
+bool forceDrumAirOverride = false;
+bool forceSprayOverride   = false;
+
 float lastIsoLowPSI   = 0.0f;
 float lastResinLowPSI = 0.0f;
 float lastIsoHPPSI    = 0.0f;
