@@ -64,32 +64,31 @@ void handleSettings() {
       server.send(400, "text/plain", "Invalid JSON");
       return;
     }
-    // IMPORTANT: only update fields that are actually present in the JSON.
-    // This prevents accidental overwrites to zero when the UI submits blank fields.
-    if (doc.containsKey("target") && doc["target"].is<int>())         targetPressure = doc["target"].as<int>();
-    if (doc.containsKey("margin") && doc["margin"].is<int>())         marginPercent  = doc["margin"].as<int>();
-    if (doc.containsKey("diff") && doc["diff"].is<int>())             diffPressure   = doc["diff"].as<int>();
-    if (doc.containsKey("airTarget") && doc["airTarget"].is<int>())   airTarget      = doc["airTarget"].as<int>();
-    if (doc.containsKey("gunTarget") && doc["gunTarget"].is<int>())   gunTarget      = doc["gunTarget"].as<int>();
-    if (doc.containsKey("isoLowTarget") && doc["isoLowTarget"].is<int>())     isoLowTarget   = doc["isoLowTarget"].as<int>();
-    if (doc.containsKey("resinLowTarget") && doc["resinLowTarget"].is<int>()) resinLowTarget = doc["resinLowTarget"].as<int>();
-    if (doc.containsKey("supplyLow") && doc["supplyLow"].is<int>())   supplyLowPSI   = doc["supplyLow"].as<int>();
+    targetPressure      = doc["target"]         | targetPressure;
+    marginPercent       = doc["margin"]         | marginPercent;
+    diffPressure        = doc["diff"]           | diffPressure;
+    airTarget           = doc["airTarget"]      | airTarget;
+    gunTarget           = doc["gunTarget"]      | gunTarget;
+    isoLowTarget        = doc["isoLowTarget"]   | isoLowTarget;
+    resinLowTarget      = doc["resinLowTarget"] | resinLowTarget;
+    supplyLowPSI        = doc["supplyLow"]      | supplyLowPSI;
 
-    if (doc.containsKey("isoTempTarget") && doc["isoTempTarget"].is<int>())         isoTempTargetF      = doc["isoTempTarget"].as<int>();
-    if (doc.containsKey("resinTempTarget") && doc["resinTempTarget"].is<int>())     resinTempTargetF    = doc["resinTempTarget"].as<int>();
-    if (doc.containsKey("isoLowTempTarget") && doc["isoLowTempTarget"].is<int>())   isoLowTempTargetF   = doc["isoLowTempTarget"].as<int>();
-    if (doc.containsKey("resinLowTempTarget") && doc["resinLowTempTarget"].is<int>()) resinLowTempTargetF = doc["resinLowTempTarget"].as<int>();
-    if (doc.containsKey("tempMinF") && doc["tempMinF"].is<int>())                   tempMinF            = doc["tempMinF"].as<int>();
-    if (doc.containsKey("tempMaxF") && doc["tempMaxF"].is<int>())                   tempMaxF            = doc["tempMaxF"].as<int>();
+    isoTempTargetF      = doc["isoTempTarget"]      | isoTempTargetF;
+    resinTempTargetF    = doc["resinTempTarget"]    | resinTempTargetF;
+    isoLowTempTargetF   = doc["isoLowTempTarget"]   | isoLowTempTargetF;
+    resinLowTempTargetF = doc["resinLowTempTarget"] | resinLowTempTargetF;
+    tempMinF            = doc["tempMinF"]           | tempMinF;
+    tempMaxF            = doc["tempMaxF"]           | tempMaxF;
 
     // Hose heat settings
-    if (doc.containsKey("hose1Set") && doc["hose1Set"].is<int>()) hose1SetF = doc["hose1Set"].as<int>();
-    if (doc.containsKey("hose2Set") && doc["hose2Set"].is<int>()) hose2SetF = doc["hose2Set"].as<int>();
-    if (doc.containsKey("hose1Tol") && doc["hose1Tol"].is<int>()) hose1TolF = doc["hose1Tol"].as<int>();
-    if (doc.containsKey("hose2Tol") && doc["hose2Tol"].is<int>()) hose2TolF = doc["hose2Tol"].as<int>();
-    if (doc.containsKey("hose1En")  && doc["hose1En"].is<bool>())  hose1Enabled = doc["hose1En"].as<bool>();
-    if (doc.containsKey("hose2En")  && doc["hose2En"].is<bool>())  hose2Enabled = doc["hose2En"].as<bool>();
-    if (doc.containsKey("hoseOvertempF") && doc["hoseOvertempF"].is<int>()) hoseOvertempF = doc["hoseOvertempF"].as<int>();
+    hose1SetF = doc["hose1Set"] | hose1SetF;
+    hose2SetF = doc["hose2Set"] | hose2SetF;
+    hose1TolF = doc["hose1Tol"] | hose1TolF;
+    hose2TolF = doc["hose2Tol"] | hose2TolF;
+    if (doc["hose1En"].is<bool>()) hose1Enabled = doc["hose1En"];
+    if (doc["hose2En"].is<bool>()) hose2Enabled = doc["hose2En"];
+
+    if (doc["hoseOvertempF"].is<int>()) hoseOvertempF = doc["hoseOvertempF"];
 
     // Clamp sane ranges
     if (hose1SetF < 40) hose1SetF = 40;
@@ -104,39 +103,33 @@ void handleSettings() {
     if (hoseOvertempF < 1) hoseOvertempF = 1;
     if (hoseOvertempF > 50) hoseOvertempF = 50;
 
-    if (doc.containsKey("wifiMode") && doc["wifiMode"].is<int>()) {
+    if (doc["wifiMode"].is<int>()) {
       networkMode = (int)doc["wifiMode"];
       if (networkMode != NETMODE_AP && networkMode != NETMODE_STA) {
         networkMode = NETMODE_AP;
       }
     }
-    // Wi-Fi strings: only update if present AND non-empty, to avoid accidental blank saves.
-    if (doc.containsKey("apSsid") && doc["apSsid"].is<const char*>()) {
+    if (doc["apSsid"].is<const char*>()) {
       const char* v = doc["apSsid"];
-      if (v && v[0] != '\0') apSsid = String(v);
+      if (v) apSsid = String(v);
     }
-    if (doc.containsKey("apPass") && doc["apPass"].is<const char*>()) {
+    if (doc["apPass"].is<const char*>()) {
       const char* v = doc["apPass"];
-      if (v && v[0] != '\0') apPass = String(v);
+      if (v) apPass = String(v);
     }
-    if (doc.containsKey("staSsid") && doc["staSsid"].is<const char*>()) {
+    if (doc["staSsid"].is<const char*>()) {
       const char* v = doc["staSsid"];
-      if (v && v[0] != '\0') staSsid = String(v);
+      if (v) staSsid = String(v);
     }
-    if (doc.containsKey("staPass") && doc["staPass"].is<const char*>()) {
+    if (doc["staPass"].is<const char*>()) {
       const char* v = doc["staPass"];
-      if (v && v[0] != '\0') staPass = String(v);
+      if (v) staPass = String(v);
     }
-
-    // Manual overrides
-    if (doc.containsKey("forceDrumAir") && doc["forceDrumAir"].is<bool>()) forceDrumAirOverride = doc["forceDrumAir"].as<bool>();
-    if (doc.containsKey("forceSpray")   && doc["forceSpray"].is<bool>())   forceSprayOverride   = doc["forceSpray"].as<bool>();
 
     // Defensive defaults: prevent saving invalid AP credentials that would break softAP().
     if (apSsid.length() == 0) apSsid = DEFAULT_AP_SSID;
     if (apPass.length() == 0) apPass = DEFAULT_AP_PASS;
 
-    // Persist
     prefs.putInt("target",         targetPressure);
     prefs.putInt("margin",         marginPercent);
     prefs.putInt("diff",           diffPressure);
@@ -162,9 +155,6 @@ void handleSettings() {
     prefs.putInt("hose2TolF", hose2TolF);
     prefs.putInt("hoseOvertempF", hoseOvertempF);
 
-    prefs.putBool("forceDrumAir", forceDrumAirOverride);
-    prefs.putBool("forceSpray",   forceSprayOverride);
-
     prefs.putInt("wifiMode", networkMode);
     prefs.putString("apSsid",  apSsid);
     prefs.putString("apPass",  apPass);
@@ -175,137 +165,6 @@ void handleSettings() {
   } else {
     server.send(405, "text/plain", "Method Not Allowed");
   }
-}
-
-// Create a backup snapshot of the current persisted settings.
-// This is intentionally simple: it stores a parallel set of *_bak keys in NVS.
-void handleSettingsBackup() {
-  if (server.method() != HTTP_POST) {
-    server.send(405, "text/plain", "Method Not Allowed");
-    return;
-  }
-
-  // Core pressure/ratio
-  prefs.putInt("target_bak",         targetPressure);
-  prefs.putInt("margin_bak",         marginPercent);
-  prefs.putInt("diff_bak",           diffPressure);
-  prefs.putInt("airTarget_bak",      airTarget);
-  prefs.putInt("gunTarget_bak",      gunTarget);
-  prefs.putInt("isoLowTarget_bak",   isoLowTarget);
-  prefs.putInt("resinLowTarget_bak", resinLowTarget);
-  prefs.putInt("supplyLow_bak",      supplyLowPSI);
-
-  // Temps
-  prefs.putInt("isoTempTarget_bak",  isoTempTargetF);
-  prefs.putInt("resTempTarget_bak",  resinTempTargetF);
-  prefs.putInt("isoLowTempTgt_bak",  isoLowTempTargetF);
-  prefs.putInt("resLowTempTgt_bak",  resinLowTempTargetF);
-  prefs.putInt("tempMinF_bak",       tempMinF);
-  prefs.putInt("tempMaxF_bak",       tempMaxF);
-
-  // Hose heat
-  prefs.putBool("hose1En_bak",       hose1Enabled);
-  prefs.putBool("hose2En_bak",       hose2Enabled);
-  prefs.putInt("hose1SetF_bak",      hose1SetF);
-  prefs.putInt("hose2SetF_bak",      hose2SetF);
-  prefs.putInt("hose1TolF_bak",      hose1TolF);
-  prefs.putInt("hose2TolF_bak",      hose2TolF);
-  prefs.putInt("hoseOvertempF_bak",  hoseOvertempF);
-
-  // Wi-Fi
-  prefs.putInt("wifiMode_bak",       networkMode);
-  prefs.putString("apSsid_bak",      apSsid);
-  prefs.putString("apPass_bak",      apPass);
-  prefs.putString("staSsid_bak",     staSsid);
-  prefs.putString("staPass_bak",     staPass);
-
-  // Manual overrides
-  prefs.putBool("forceDrumAir_bak",  forceDrumAirOverride);
-  prefs.putBool("forceSpray_bak",    forceSprayOverride);
-
-  server.send(200, "text/plain", "OK");
-}
-
-// Restore settings from the last backup snapshot.
-void handleSettingsRestore() {
-  if (server.method() != HTTP_POST) {
-    server.send(405, "text/plain", "Method Not Allowed");
-    return;
-  }
-
-  // Pull from backup keys, falling back to current runtime values if missing.
-  targetPressure      = prefs.getInt("target_bak",         targetPressure);
-  marginPercent       = prefs.getInt("margin_bak",         marginPercent);
-  diffPressure        = prefs.getInt("diff_bak",           diffPressure);
-  airTarget           = prefs.getInt("airTarget_bak",      airTarget);
-  gunTarget           = prefs.getInt("gunTarget_bak",      gunTarget);
-  isoLowTarget        = prefs.getInt("isoLowTarget_bak",   isoLowTarget);
-  resinLowTarget      = prefs.getInt("resinLowTarget_bak", resinLowTarget);
-  supplyLowPSI        = prefs.getInt("supplyLow_bak",      supplyLowPSI);
-
-  isoTempTargetF      = prefs.getInt("isoTempTarget_bak",  isoTempTargetF);
-  resinTempTargetF    = prefs.getInt("resTempTarget_bak",  resinTempTargetF);
-  isoLowTempTargetF   = prefs.getInt("isoLowTempTgt_bak",  isoLowTempTargetF);
-  resinLowTempTargetF = prefs.getInt("resLowTempTgt_bak",  resinLowTempTargetF);
-  tempMinF            = prefs.getInt("tempMinF_bak",       tempMinF);
-  tempMaxF            = prefs.getInt("tempMaxF_bak",       tempMaxF);
-
-  hose1Enabled        = prefs.getBool("hose1En_bak",       hose1Enabled);
-  hose2Enabled        = prefs.getBool("hose2En_bak",       hose2Enabled);
-  hose1SetF           = prefs.getInt("hose1SetF_bak",      hose1SetF);
-  hose2SetF           = prefs.getInt("hose2SetF_bak",      hose2SetF);
-  hose1TolF           = prefs.getInt("hose1TolF_bak",      hose1TolF);
-  hose2TolF           = prefs.getInt("hose2TolF_bak",      hose2TolF);
-  hoseOvertempF       = prefs.getInt("hoseOvertempF_bak",  hoseOvertempF);
-
-  networkMode         = prefs.getInt("wifiMode_bak",       networkMode);
-  apSsid              = prefs.getString("apSsid_bak",      apSsid);
-  apPass              = prefs.getString("apPass_bak",      apPass);
-  staSsid             = prefs.getString("staSsid_bak",     staSsid);
-  staPass             = prefs.getString("staPass_bak",     staPass);
-
-  forceDrumAirOverride = prefs.getBool("forceDrumAir_bak", forceDrumAirOverride);
-  forceSprayOverride   = prefs.getBool("forceSpray_bak",   forceSprayOverride);
-
-  // Defensive defaults for AP credentials
-  if (apSsid.length() == 0) apSsid = DEFAULT_AP_SSID;
-  if (apPass.length() == 0) apPass = DEFAULT_AP_PASS;
-
-  // Re-persist the restored values to the primary keys so they survive reboot.
-  prefs.putInt("target",         targetPressure);
-  prefs.putInt("margin",         marginPercent);
-  prefs.putInt("diff",           diffPressure);
-  prefs.putInt("airTarget",      airTarget);
-  prefs.putInt("gunTarget",      gunTarget);
-  prefs.putInt("isoLowTarget",   isoLowTarget);
-  prefs.putInt("resinLowTarget", resinLowTarget);
-  prefs.putInt("supplyLow",      supplyLowPSI);
-
-  prefs.putInt("isoTempTarget",  isoTempTargetF);
-  prefs.putInt("resTempTarget",  resinTempTargetF);
-  prefs.putInt("isoLowTempTgt",  isoLowTempTargetF);
-  prefs.putInt("resLowTempTgt",  resinLowTempTargetF);
-  prefs.putInt("tempMinF",       tempMinF);
-  prefs.putInt("tempMaxF",       tempMaxF);
-
-  prefs.putBool("hose1En",       hose1Enabled);
-  prefs.putBool("hose2En",       hose2Enabled);
-  prefs.putInt("hose1SetF",      hose1SetF);
-  prefs.putInt("hose2SetF",      hose2SetF);
-  prefs.putInt("hose1TolF",      hose1TolF);
-  prefs.putInt("hose2TolF",      hose2TolF);
-  prefs.putInt("hoseOvertempF",  hoseOvertempF);
-
-  prefs.putInt("wifiMode",       networkMode);
-  prefs.putString("apSsid",      apSsid);
-  prefs.putString("apPass",      apPass);
-  prefs.putString("staSsid",     staSsid);
-  prefs.putString("staPass",     staPass);
-
-  prefs.putBool("forceDrumAir",  forceDrumAirOverride);
-  prefs.putBool("forceSpray",    forceSprayOverride);
-
-  server.send(200, "text/plain", "OK");
 }
 
 // /calibration
@@ -661,8 +520,10 @@ void handleControl() {
         return;
       }
 
-      // Guard: only allow spray if both low sides above threshold and drum air is on
-      if (!(lastIsoLowPSI >= supplyLowPSI && lastResinLowPSI >= supplyLowPSI)) {
+      // Guard: only allow spray if both low sides above threshold (filtered/debounced)
+      // and drum air is on.
+      if (isnan(filtIsoLowPSI) || isnan(filtResinLowPSI) ||
+          !(filtIsoLowPSI >= supplyLowPSI && filtResinLowPSI >= supplyLowPSI)) {
         // Latch an interlock for low supply
         sprayInterlockActive = true;
         lastInterlockReason  = makeLowSupplyInterlockReason(lastIsoHPPSI, lastResinHPPSI,
@@ -816,12 +677,20 @@ bool hoseOvertempConditionCleared()
     if (hose2TempF > (float)(hose2SetF + hoseOvertempF)) return false;
   }
 
-  return anyAssigned;
+  // If no hose sensors are assigned, allow reset. Overtemp cannot be
+  // meaningfully validated, but the rig should not be permanently bricked.
+  // (Hose heat will remain OFF unless the user re-enables it.)
+  if (!anyAssigned) return true;
+
+  return true;
 }
 
 bool lowSupplyConditionCleared()
 {
-  return (lastIsoLowPSI >= supplyLowPSI) && (lastResinLowPSI >= supplyLowPSI);
+  // Use filtered values (debounced in app.cpp) to avoid requiring the instantaneous
+  // low-side pressure to be above threshold at the exact moment the user presses reset.
+  if (isnan(filtIsoLowPSI) || isnan(filtResinLowPSI)) return false;
+  return (filtIsoLowPSI >= supplyLowPSI) && (filtResinLowPSI >= supplyLowPSI);
 }
 
 void handleInterlockReset()

@@ -242,15 +242,15 @@ float resinLowK  = 1.0f;
 bool drumAirEnabled = false;  // relay on 26
 bool sprayEnabled   = false;  // relay on 25
 
-// Manual relay overrides (persisted). These are intended for troubleshooting
-// and commissioning when spurious interlocks are suspected.
-bool forceDrumAirOverride = false;
-bool forceSprayOverride   = false;
-
 float lastIsoLowPSI   = 0.0f;
 float lastResinLowPSI = 0.0f;
 float lastIsoHPPSI    = 0.0f;
 float lastResinHPPSI  = 0.0f;
+
+// Filtered low-side pressures. Used for low-supply interlock decisions so that
+// brief transients do not latch an interlock.
+float filtIsoLowPSI   = NAN;
+float filtResinLowPSI = NAN;
 
 // ---------- Hose heat control (2 zones) ----------
 // Backend-only for now: exposes enable/setpoint/tolerance + relay output state

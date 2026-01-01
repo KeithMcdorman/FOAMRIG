@@ -82,15 +82,14 @@ extern float resinLowK;
 extern bool drumAirEnabled;
 extern bool sprayEnabled;
 
-// Manual overrides (for troubleshooting / commissioning)
-// When true, the relay output is forced ON regardless of alarms/interlocks.
-extern bool forceDrumAirOverride;
-extern bool forceSprayOverride;
-
 extern float lastIsoLowPSI;
 extern float lastResinLowPSI;
 extern float lastIsoHPPSI;
 extern float lastResinHPPSI;
+
+// Filtered low-side pressures (for interlock/debounce decisions)
+extern float filtIsoLowPSI;
+extern float filtResinLowPSI;
 
 // ---------- Hose heat control (2 zones) ----------
 extern bool hose1Enabled;

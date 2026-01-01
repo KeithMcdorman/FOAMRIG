@@ -25,8 +25,6 @@ void handleSettingsPage();
 void handleUpdatePage();
 void handleUpdateUpload();
 void handleSettings();
-void handleSettingsBackup();
-void handleSettingsRestore();
 void handleCalibration();
 void handleCalibrationStatus();
 void handleLiveStatus();
@@ -163,8 +161,6 @@ void setup() {
   server.on("/", HTTP_GET, handleRoot);
   server.on("/settings", HTTP_GET, handleSettingsPage);
   server.on("/api/settings", handleSettings);
-  server.on("/api/settings/backup", HTTP_POST, handleSettingsBackup);
-  server.on("/api/settings/restore", HTTP_POST, handleSettingsRestore);
   server.on("/calibration", handleCalibration);
   server.on("/calibration/status", HTTP_GET, handleCalibrationStatus);
   server.on("/api/temp-sensors", handleTempSensors);
@@ -449,8 +445,9 @@ void hmiPollUart()
                 sprayEnabled = false;
                 digitalWrite(RELAY_SPRAY_PIN, LOW);
               }
-              // Low-side supply guard
-              else if (!(lastIsoLowPSI >= supplyLowPSI && lastResinLowPSI >= supplyLowPSI)) {
+              // Low-side supply guard (filtered/debounced)
+              else if (isnan(filtIsoLowPSI) || isnan(filtResinLowPSI) ||
+                       !(filtIsoLowPSI >= supplyLowPSI && filtResinLowPSI >= supplyLowPSI)) {
                 sprayInterlockActive = true;
                 lastInterlockReason  = makeLowSupplyInterlockReason(lastIsoHPPSI, lastResinHPPSI,
                                                                    lastIsoLowPSI, lastResinLowPSI,
@@ -578,18 +575,35 @@ void loop() {
     lastIsoLowPSI   = isoLowPSI;
     lastResinLowPSI = resinLowPSI;
 
-    // Auto-interlock: if in Spray mode and either low side drops below threshold,
-    // park (spray off) and shut off drum pump air.
-    if (sprayEnabled && (isoLowPSI < supplyLowPSI || resinLowPSI < supplyLowPSI)) {
-      Serial.println("Supply low: auto park & drum air off");
-      sprayEnabled   = false;
-      drumAirEnabled = false;
-      digitalWrite(RELAY_SPRAY_PIN, LOW);
-      digitalWrite(RELAY_DRUM_AIR_PIN, LOW);
-      sprayInterlockActive = true;
-      lastInterlockReason  = makeLowSupplyInterlockReason(isoPSI, resinPSI,
-                                                         isoLowPSI, resinLowPSI,
-                                                         supplyLowPSI);
+    // Low-side filtering + debounce for interlock decisions.
+    // This prevents brief transient dips (common with piston-driven proportioners)
+    // from latching a low-supply interlock.
+    if (isnan(filtIsoLowPSI))   filtIsoLowPSI   = isoLowPSI;
+    if (isnan(filtResinLowPSI)) filtResinLowPSI = resinLowPSI;
+    const float alpha = 0.20f; // ~1 s time constant at 200 ms loop
+    filtIsoLowPSI   = filtIsoLowPSI   + alpha * (isoLowPSI   - filtIsoLowPSI);
+    filtResinLowPSI = filtResinLowPSI + alpha * (resinLowPSI - filtResinLowPSI);
+
+    // Auto-interlock: if in Spray mode and either low side is *persistently* below
+    // threshold, park (spray off) and shut off drum pump air.
+    static unsigned long lowSupplySince = 0;
+    const bool lowSupplyNow = (filtIsoLowPSI < supplyLowPSI) || (filtResinLowPSI < supplyLowPSI);
+    if (sprayEnabled && lowSupplyNow) {
+      if (lowSupplySince == 0) lowSupplySince = now;
+      // Require condition to persist for 1.0 s before latching.
+      if ((now - lowSupplySince) >= 1000UL) {
+        Serial.println("Supply low (debounced): auto park & drum air off");
+        sprayEnabled   = false;
+        drumAirEnabled = false;
+        digitalWrite(RELAY_SPRAY_PIN, LOW);
+        digitalWrite(RELAY_DRUM_AIR_PIN, LOW);
+        sprayInterlockActive = true;
+        lastInterlockReason  = makeLowSupplyInterlockReason(isoPSI, resinPSI,
+                                                           isoLowPSI, resinLowPSI,
+                                                           supplyLowPSI);
+      }
+    } else {
+      lowSupplySince = 0;
     }
 
     // --- Hose-tip LED mode based on Iso HP vs green band ---
